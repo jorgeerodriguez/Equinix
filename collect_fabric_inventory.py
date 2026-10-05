@@ -7,8 +7,9 @@ per user/org), or set EQUINIX_TOKEN to reuse an existing bearer token.
 
 Progress/status messages go to stderr; the JSON inventory goes to stdout, e.g.
     python collect_fabric_inventory.py > inventory.json
-Add --html to also write a shareable HTML report:
-    python collect_fabric_inventory.py --html inventory.html > inventory.json
+Add --html to also write a shareable HTML report, and --pdf for a PDF copy
+named Equinix_Report_{Date}_{Time}.pdf (in ./reports unless a folder is given):
+    python collect_fabric_inventory.py --html inventory.html --pdf > inventory.json
 
 Besides inventory it collects bandwidth utilization (--days, default 90),
 invoices from the Billing API, and list prices used for right-sizing.
@@ -17,6 +18,7 @@ import argparse
 import datetime
 import json
 import os
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -28,6 +30,7 @@ from equinix.services import fabricv4
 from insights import (INVOICE_FIELDS, bgp_health, bgp_settings, rightsizing,
                       route_table, scrub, summarize_billing, summarize_stats,
                       trim_lines)
+from pdf_export import write_pdf
 from report import render_html
 
 load_dotenv()
@@ -443,6 +446,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--html", metavar="PATH",
                         help="also write an HTML report to PATH")
+    parser.add_argument("--pdf", nargs="?", const="reports", metavar="DIR",
+                        help="also write Equinix_Report_{Date}_{Time}.pdf to DIR "
+                             "(default ./reports); needs Chrome, Chromium or Edge")
     parser.add_argument("--days", type=int, default=90,
                         help="utilization window in days (default 90)")
     args = parser.parse_args()
@@ -522,10 +528,17 @@ def main():
         log(f"# Run-rate {money(billing['run_rate'])}/mo | last 12 months "
             f"{money(billing['last12_total'])} | potential savings "
             f"{money(sizing['monthly_savings'])}/mo")
+    if args.html or args.pdf:
+        html = render_html(inventory)
     if args.html:
         with open(args.html, "w", encoding="utf-8") as f:
-            f.write(render_html(inventory))
+            f.write(html)
         log(f"HTML report written to {args.html}")
+    if args.pdf:
+        try:
+            log(f"PDF report written to {write_pdf(html, args.pdf)}")
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            log(f"[pdf] FAILED: {e}")
 
 
 if __name__ == "__main__":

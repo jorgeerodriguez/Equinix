@@ -504,7 +504,7 @@ tr.gone td { color: var(--muted); }
 tr.gone td.name { text-decoration: line-through; text-decoration-color: var(--off); }
 .name { font-weight: 600; }
 .mono, td.date { font-family: var(--mono); font-size: 12.5px; }
-.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .ep { display: grid; line-height: 1.3; }
 .ep small { font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
 .arrow { color: var(--muted); padding-inline: 0; }
@@ -540,6 +540,51 @@ ul.method { margin: 0; padding-left: 18px; color: var(--fg2); font-size: 13px; d
 footer { color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
 @media (max-width: 560px) { h1 { font-size: 27px; } .kpi .num { font-size: 27px; } input[type=search] { width: 100%; } }
 @media (prefers-reduced-motion: no-preference) { .hbar .bar, .meter .fill { transition: width .3s ease; } }
+
+/* PDF mode (#pdf): lay out at the printed page width so charts are drawn at final size. */
+html.pdf body { padding: 0; }
+html.pdf .wrap, html.pdf section, html.pdf header { display: block; max-width: none; }
+html.pdf .wrap > * + *, html.pdf section > * + * { margin-top: 16px; }
+html.pdf header > * + * { margin-top: 12px; }
+html.pdf .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+/* Chrome overlaps content when a grid row is pushed to the next page, so the
+   PDF lays cards out as block / inline blocks, which paginate cleanly. */
+html.pdf .grid2 { display: block; }
+html.pdf .grid2 > .card + .card { margin-top: 16px; }
+html.pdf .findings { display: block; }
+html.pdf .findings > .finding { display: inline-grid; vertical-align: top;
+  width: calc((100% - 24px) / 3); margin: 0 12px 12px 0; }
+html.pdf .findings > .finding:nth-child(3n) { margin-right: 0; }
+html.pdf .multiples { display: block; }
+html.pdf .multiples > .panel { display: inline-block; vertical-align: top;
+  width: calc((100% - 12px) / 2); margin: 0 12px 12px 0; }
+html.pdf .multiples > .panel:nth-child(2n) { margin-right: 0; }
+
+/* Print / PDF: landscape Letter, light palette, no controls, keep cards whole. */
+@page { size: letter landscape; margin: 10mm 11mm; }
+@media print {
+  :root, :root:not([data-theme="light"]), :root[data-theme="dark"] {
+    --bg: #ffffff; --surface: #ffffff; --fg: #141c24; --fg2: #46535f; --muted: #6f7b86;
+    --line: #e1e5e8; --axis: #c3c9ce; --accent: #0b6e85; --accent-soft: #e2f1f4;
+    --good: #0f7a3d; --good-soft: #e2f3e8; --warn: #9a5b00; --warn-soft: #fbf0dc;
+    --off: #6b7580; --off-soft: #eceff2;
+    --c-gcp: #2a78d6; --c-aws: #eb6834; --c-ne: #1baf7a; --c-cr: #eda100; --c-inet: #e87ba4; --c-other: #9aa3ab;
+    color-scheme: light; }
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body { padding: 0; font-size: 12px; }
+  .wrap { gap: 20px; max-width: none; }
+  nav, .controls, details.tv > summary, .tip { display: none !important; }
+  #spend, #utilization, #rightsizing, #reliability, #inventory { break-before: page; }
+  .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .sec-head, .card-head, .lede { break-after: avoid; }
+  .chart, .kpis, tr, .hbar, .legend { break-inside: avoid; }
+  td.date, td.num { white-space: nowrap; }
+  .frame { overflow: visible; }
+  td, th { white-space: normal; padding: 6px 8px; }
+  table { font-size: 11px; }
+  .chart svg { height: auto; }
+  tbody tr:hover td { background: none; }
+}
 </style>
 
 <div class="wrap">
@@ -632,6 +677,7 @@ footer { color: var(--muted); font-size: 12px; border-top: 1px solid var(--line)
 </div>
 
 <script>
+if (location.hash === "#pdf") document.documentElement.classList.add("pdf");
 const D = __DATA__;
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -1089,6 +1135,25 @@ function segment(el) {
 document.querySelectorAll(".seg").forEach(segment);
 $("conn-search").oninput = e => { state.connections.q = e.target.value.trim(); render("connections"); };
 Object.keys(TABLES).forEach(render);
+// PDF mode (#pdf): open folded content and show every inventory row.
+if (location.hash === "#pdf") {
+  // One findings list in the PDF (nothing is folded on paper).
+  $("findings").append(...$("findings-more").children);
+  $("more-findings").remove();
+  // Unwrap <details>: Chrome clips their content at page breaks when printing.
+  document.querySelectorAll("details").forEach(d => {
+    const box = document.createElement("div");
+    box.hidden = d.hidden;
+    box.style.marginTop = "12px";
+    [...d.children].filter(c => c.tagName !== "SUMMARY").forEach(c => box.appendChild(c));
+    d.replaceWith(box);
+  });
+  for (const id of ["routers", "connections"]) {
+    state[id].filters.lifecycle = "all";
+    if (state[id].filters.cloud) state[id].filters.cloud = "all";
+    render(id);
+  }
+}
 $("foot").textContent = "Source: Equinix Fabric v4 (connections, Cloud Routers, routes, routing protocols, statistics, Cloud Events, prices), Network Edge v1 and Billing v2 APIs, via collect_fabric_inventory.py. Amounts in " + (B ? B.currency : "USD") + ", before tax unless noted.";
 </script>
 """
