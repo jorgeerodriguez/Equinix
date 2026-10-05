@@ -26,12 +26,14 @@ LINE_FIELDS = ["transactionId", "transactionDate", "activityType",
                "recurringStartDate", "recurringEndDate", "recurringAmount",
                "nonRecurringAmount", "adjustment", "taxAmount", "totalAmount",
                "currencyCode"]
-SECRET_KEYS = re.compile(r"pass(word)?|pwd|secret|license(Key|Token)", re.I)
+SECRET_KEYS = re.compile(
+    r"pass(word)?|pwd|secret|auth(entication)?_?key|private_?key|"
+    r"license(Key|Token)", re.I)
 
 
 def scrub(obj):
     """Recursively drop credential-like fields (the NE API returns admin
-    passwords for cluster nodes)."""
+    passwords for cluster nodes; routing protocols return BGP auth keys)."""
     if isinstance(obj, dict):
         return {k: scrub(v) for k, v in obj.items() if not SECRET_KEYS.search(k)}
     if isinstance(obj, list):
@@ -249,3 +251,142 @@ def rightsizing(utilization, prices, current_items):
     return {"headroom": HEADROOM, "idle_mbps": IDLE_MBPS, "tiers": tiers,
             "links": recs,
             "monthly_savings": round(sum(r["savings"] for r in recs), 2)}
+
+
+# ---------------------------------------------------------------- reliability
+
+# Session drops shorter than this are counted as flaps rather than outages.
+FLAP_SECONDS = 60
+# Sessions re-establishing on this many links within RESET_WINDOW with no
+# preceding drop are reported as one network-wide reset.
+RESET_LINKS = 3
+RESET_WINDOW = datetime.timedelta(minutes=5)
+
+
+def parse_time(value):
+    """Parse API timestamps, which can carry nanosecond precision."""
+    value = value.replace("Z", "+00:00")
+    m = re.match(r"(.*?\.\d{1,6})\d*(\+.*)", value)
+    return datetime.datetime.fromisoformat(m.group(1) + m.group(2) if m else value)
+
+
+def bgp_health(events, conns, start, end):
+    """Outages, flaps and network-wide resets per connection from Cloud Events.
+
+    A BGP session is down from its first non-Established state change until
+    it is Established again.
+    """
+    names = {c["uuid"]: c for c in conns}
+    sessions = defaultdict(list)
+    conn_down = defaultdict(list)
+    for e in events:
+        m = re.search(r"connections/([0-9a-f-]{36})", e.get("subject") or "")
+        if not m:
+            continue
+        kind = (e.get("type") or "").rsplit(".", 1)[-1]
+        when = parse_time(e["time"])
+        if "_session." in e.get("type", ""):
+            sessions[(m.group(1), e["subject"])].append((when, kind))
+        elif e.get("type", "").endswith("connection.status.down"):
+            conn_down[m.group(1)].append(when)
+
+    links = defaultdict(lambda: {"episodes": [], "resets": []})
+    for (cu, _), changes in sessions.items():
+        down_since = None
+        for when, kind in sorted(changes):
+            if kind == "established":
+                if down_since:
+                    links[cu]["episodes"].append((down_since, when))
+                    down_since = None
+                else:
+                    links[cu]["resets"].append(when)
+            elif down_since is None:
+                down_since = when
+        if down_since:
+            links[cu]["episodes"].append((down_since, end))
+
+    # Resets seen on several links at once are network-wide events.
+    all_resets = sorted((t, cu) for cu, v in links.items() for t in v["resets"])
+    network_resets = []
+    i = 0
+    while i < len(all_resets):
+        j = i
+        while j < len(all_resets) and all_resets[j][0] - all_resets[i][0] <= RESET_WINDOW:
+            j += 1
+        if len({cu for _, cu in all_resets[i:j]}) >= RESET_LINKS:
+            network_resets.append(all_resets[i][0])
+            i = j
+        else:
+            i += 1
+
+    window = (end - start).total_seconds()
+    rows = []
+    for cu, c in names.items():
+        episodes = links[cu]["episodes"] if cu in links else []
+        outages = [(a, b) for a, b in episodes if (b - a).total_seconds() >= FLAP_SECONDS]
+        flaps = [(a, b) for a, b in episodes if (b - a).total_seconds() < FLAP_SECONDS]
+        downtime = sum((b - a).total_seconds() for a, b in episodes)
+        rows.append({
+            "uuid": cu, "name": c.get("name"), "cloud": c.get("cloud"),
+            "monitored": cu in links,
+            "outages": [{"start": a.isoformat(), "end": b.isoformat(),
+                         "seconds": round((b - a).total_seconds()),
+                         "link_down": any(a - datetime.timedelta(minutes=5) <= t <= b
+                                          for t in conn_down.get(cu, []))}
+                        for a, b in outages],
+            "flaps": [{"start": a.isoformat(), "seconds": round((b - a).total_seconds())}
+                      for a, b in flaps],
+            "downtime_seconds": round(downtime),
+            "availability": round(100 * (1 - downtime / window), 4) if window else 100,
+            "longest_seconds": round(max(((b - a).total_seconds() for a, b in episodes),
+                                         default=0)),
+        })
+    return {"start": start.isoformat(), "end": end.isoformat(),
+            "flap_seconds": FLAP_SECONDS,
+            "network_resets": [t.isoformat() for t in network_resets],
+            "links": rows}
+
+
+def bgp_settings(protocols_by_conn, conns):
+    """BFD, ASN and session state per connection from its routing protocols."""
+    rows = []
+    for c in conns:
+        bgp = next((p for p in protocols_by_conn.get(c["uuid"], [])
+                    if p.get("type") == "BGP"), None)
+        if not bgp:
+            continue
+        v4 = bgp.get("bgpIpv4") or {}
+        rows.append({
+            "uuid": c["uuid"], "name": c.get("name"), "cloud": c.get("cloud"),
+            "customer_asn": bgp.get("customerAsn"),
+            "equinix_asn": bgp.get("equinixAsn"),
+            "bfd": bool((bgp.get("bfd") or {}).get("enabled")),
+            "status": (v4.get("operation") or {}).get("operationalStatus"),
+            "since": (v4.get("operation") or {}).get("opStatusChangedAt"),
+            "prepend": v4.get("outboundASPrependCount", 0),
+        })
+    return rows
+
+
+# -------------------------------------------------------------------- routing
+
+def route_table(routes, conns):
+    """Group Cloud Router routes by prefix and check each has a backup path."""
+    by_name = {c.get("name"): c for c in conns}
+    prefixes = defaultdict(list)
+    for r in routes:
+        if r.get("state") != "ACTIVE" or "DIRECT" in (r.get("type") or ""):
+            continue
+        name = (r.get("connection") or {}).get("name")
+        c = by_name.get(name, {})
+        prefixes[r.get("prefix")].append({
+            "connection": name, "cloud": c.get("cloud"),
+            "next_hop": r.get("nextHop"), "as_path": r.get("asPath") or [],
+        })
+    rows = []
+    for prefix, paths in prefixes.items():
+        origin = paths[0]["as_path"][-1] if paths[0]["as_path"] else ""
+        rows.append({"prefix": prefix, "paths": paths, "redundant": len(paths) > 1,
+                     "origin_asn": origin, "cloud": paths[0]["cloud"]})
+    key = lambda r: tuple(int(x) for x in re.split(r"[./]", r["prefix"]) if x.isdigit())
+    return sorted(rows, key=key)

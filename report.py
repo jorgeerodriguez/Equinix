@@ -161,6 +161,68 @@ def cloud_totals(util_rows):
 
 # ------------------------------------------------------------------ findings
 
+def duration(seconds):
+    if seconds < 90:
+        return f"{seconds:.0f} s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.1f} h"
+
+
+def short_date(iso):
+    return datetime.datetime.fromisoformat(iso).strftime("%b %-d")
+
+
+def reliability_findings(health, routes, sizing):
+    out = []
+    if health:
+        links = [h for h in health["links"] if h["monitored"]]
+        idle = {r["uuid"] for r in (sizing or {}).get("links", [])
+                if r["action"] == "decommission"}
+        by_uuid = {h["uuid"]: h for h in links}
+        prod = [h for h in links if h["uuid"] not in idle and h["outages"]]
+        if prod:
+            worst = max(prod, key=lambda h: h["downtime_seconds"])
+            first = worst["outages"][0]
+            sized = {r["uuid"]: r for r in (sizing or {}).get("links", [])}
+            mine = sized.get(worst["uuid"], {})
+            partner = next((r for r in sized.values() if r["uuid"] != worst["uuid"]
+                            and (r["cloud"], r["bandwidth"]) ==
+                            (mine.get("cloud"), mine.get("bandwidth"))), None)
+            partner_ok = partner and not any(
+                o["start"] < first["end"] and o["end"] > first["start"]
+                for o in by_uuid.get(partner["uuid"], {}).get("outages", []))
+            out.append(("warn", f"{len(prod)} production link{'s' if len(prod) > 1 else ''} "
+                        f"had outages in the last {health['days']} days",
+                        f"Longest: {worst['name']}, {duration(worst['downtime_seconds'])} "
+                        f"in total starting {short_date(first['start'])}"
+                        + (f"; its partner {partner['name']} stayed up, so traffic "
+                           "kept flowing." if partner_ok else ".")))
+        flappy = [h for h in links if len(h["flaps"]) >= 5]
+        if flappy:
+            n = sum(len(h["flaps"]) for h in flappy)
+            longest = max(f["seconds"] for h in flappy for f in h["flaps"])
+            clouds = sorted({CLOUD_NAMES.get(h["cloud"], h["cloud"]) for h in flappy})
+            out.append(("warn", f"{' and '.join(clouds)} BGP sessions drop often",
+                        f"{n} brief drops across {len(flappy)} links, each back within "
+                        f"{longest} s. The redundant pair absorbs them, but it is worth "
+                        "raising with the provider."))
+        no_bfd = [h for h in links if h.get("bfd") is False]
+        if no_bfd and len(no_bfd) == len(links):
+            out.append(("info", "BFD is off on every link",
+                        "Without BFD, failover waits for the BGP hold timer (often "
+                        "90 seconds or more). Enabling BFD on both sides cuts that to "
+                        "about a second."))
+    single = [r for r in routes or [] if not r["redundant"]]
+    if single:
+        out.append(("warn", f"{len(single)} network{'s' if len(single) > 1 else ''} "
+                    "with a single path",
+                    ", ".join(f"{r['prefix']} (via {r['paths'][0]['connection']})"
+                              for r in single) + " has no backup connection on the "
+                    "Cloud Router."))
+    return out
+
+
 def findings(billing, util_rows, sizing, active_conns):
     """Plain-language key findings, most important first."""
     out = []
@@ -186,8 +248,11 @@ def findings(billing, util_rows, sizing, active_conns):
         down = [r for r in sizing["links"] if r["action"] == "downsize"]
         parts = []
         if idle:
+            carried = sorted({p for r in idle for p in r.get("prefixes", [])})
             parts.append(f"decommissioning {len(idle)} idle links "
-                         f"({', '.join(r['name'] for r in idle)})")
+                         f"({', '.join(r['name'] for r in idle)}"
+                         + (f", after moving or retiring {', '.join(carried)}"
+                            if carried else "") + ")")
         if down:
             tiers = sorted({(r["bandwidth"], r["recommended"]) for r in down})
             parts.append(f"downsizing {len(down)} links "
@@ -230,12 +295,25 @@ def findings(billing, util_rows, sizing, active_conns):
     return [{"tone": t, "title": a, "body": b} for t, a, b in out]
 
 
+def order_findings(items):
+    """Warnings first, then savings/good news, then context."""
+    rank = {"warn": 0, "good": 1, "info": 2}
+    return sorted(items, key=lambda f: rank.get(f["tone"], 3))
+
+
 # ---------------------------------------------------------------------- build
 
 def build_data(inventory):
     conns, routers = inventory["connections"], inventory["cloud_routers"]
     billing = inventory.get("billing") or None
     sizing = inventory.get("rightsizing") or None
+    health = inventory.get("reliability") or None
+    routes = inventory.get("routes") or []
+    if sizing:
+        # Networks each link carries, so decommissioning can be checked.
+        for link in sizing["links"]:
+            link["prefixes"] = [r["prefix"] for r in routes
+                                if any(p["connection"] == link["name"] for p in r["paths"])]
     util = (inventory.get("utilization") or {}).get("connections") or []
     costs = {i["uuid"]: i["amount"] for i in (billing or {}).get("current_items", [])
              if i.get("uuid")}
@@ -269,7 +347,11 @@ def build_data(inventory):
         },
         "util": util_rows,
         "sizing": sizing,
-        "findings": findings(billing, util_rows, sizing, active),
+        "findings": order_findings(findings(billing, util_rows, sizing, active)
+                                   + [dict(zip(("tone", "title", "body"), f)) for f in
+                                      reliability_findings(health, routes, sizing)]),
+        "reliability": health,
+        "routes": routes,
         "footprint": {
             "active": len(active),
             "cloudLinks": len(cloud_links),
@@ -300,6 +382,8 @@ TEMPLATE = r"""<title>Equinix Interconnect Report</title>
   --line: #e1e5e8; --axis: #c3c9ce; --accent: #0b6e85; --accent-soft: #e2f1f4;
   --good: #0f7a3d; --good-soft: #e2f3e8; --warn: #9a5b00; --warn-soft: #fbf0dc;
   --off: #6b7580; --off-soft: #eceff2;
+  /* status marks (fixed across themes) */
+  --crit: #d03b3b; --warn-mark: #fab219;
   /* categorical slots 1-5, validated order */
   --c-gcp: #2a78d6; --c-aws: #eb6834; --c-ne: #1baf7a; --c-cr: #eda100; --c-inet: #e87ba4; --c-other: #9aa3ab;
   --display: "IBM Plex Sans Condensed", "Arial Narrow", sans-serif;
@@ -449,6 +533,10 @@ input[type=search] { font: inherit; font-size: 13px; padding: 5px 10px; border: 
 .count { font-family: var(--mono); font-size: 12px; color: var(--muted); }
 .empty { padding: 18px; color: var(--muted); }
 ul.method { margin: 0; padding-left: 18px; color: var(--fg2); font-size: 13px; display: grid; gap: 4px; max-width: 90ch; }
+.lane-label { fill: var(--fg2); font-size: 12px; font-family: var(--body); }
+.status-crit { fill: var(--crit); } .status-warn { fill: var(--warn-mark); }
+.reset-line { stroke: var(--axis); stroke-width: 1; }
+.prefix-note { display: block; font-size: 11.5px; color: var(--muted); margin-top: 2px; white-space: normal; }
 footer { color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
 @media (max-width: 560px) { h1 { font-size: 27px; } .kpi .num { font-size: 27px; } input[type=search] { width: 100%; } }
 @media (prefers-reduced-motion: no-preference) { .hbar .bar, .meter .fill { transition: width .3s ease; } }
@@ -465,13 +553,15 @@ footer { color: var(--muted); font-size: 12px; border-top: 1px solid var(--line)
     </div>
     <nav aria-label="Sections">
       <a href="#summary">Summary</a><a href="#spend">Spend</a><a href="#utilization">Utilization</a>
-      <a href="#rightsizing">Right-sizing</a><a href="#inventory">Inventory</a>
+      <a href="#rightsizing">Right-sizing</a><a href="#reliability">Reliability</a>
+      <a href="#routing">Routing</a><a href="#inventory">Inventory</a>
     </nav>
   </header>
 
   <section id="summary">
     <div class="kpis" id="kpis"></div>
     <div class="findings" id="findings"></div>
+    <details class="tv" id="more-findings" hidden><summary></summary><div class="findings" id="findings-more" style="margin-top:12px"></div></details>
   </section>
 
   <section id="spend">
@@ -502,6 +592,24 @@ footer { color: var(--muted); font-size: 12px; border-top: 1px solid var(--line)
     <div class="sec-head"><h2>Right-sizing</h2><span class="count" id="size-sub"></span></div>
     <div class="frame"><table id="size-table"></table></div>
     <ul class="method" id="method"></ul>
+  </section>
+
+  <section id="reliability">
+    <div class="sec-head"><h2>Reliability</h2><span class="count" id="rel-sub"></span></div>
+    <p class="lede">BGP session drops on each link, from Equinix Cloud Events. Drops under a minute are flaps; longer ones are outages.</p>
+    <div class="card">
+      <div class="card-head"><h3>Session timeline</h3><span class="sub">UTC</span></div>
+      <div class="chart" id="timeline"></div>
+      <div class="legend" id="timeline-legend"></div>
+      <p class="note" id="timeline-note"></p>
+    </div>
+    <div class="frame"><table id="rel-table"></table></div>
+  </section>
+
+  <section id="routing">
+    <div class="sec-head"><h2>Routing</h2><span class="count" id="route-sub"></span></div>
+    <p class="lede">Networks the Cloud Router learns over BGP, and whether each one has a backup path.</p>
+    <div class="frame"><table id="route-table"></table></div>
   </section>
 
   <section id="inventory">
@@ -601,13 +709,28 @@ if (B) {
 if (S) kpis.push(["Potential savings", money(S.monthly_savings), "/mo", `${money(S.monthly_savings * 12)} per year`]);
 if (U) kpis.push(["Peak traffic per cloud", mbps(F.peakCloud).split(" ")[0], mbps(F.peakCloud).split(" ")[1],
   `Busiest cloud, all its links combined · ${bw(F.cloudCapacity)} provisioned on ${F.cloudLinks} links`]);
+const R = D.reliability;
+if (R) {
+  const mon = R.links.filter(l => l.monitored);
+  const decom = new Set((S ? S.links : []).filter(r => r.action === "decommission").map(r => r.uuid));
+  const prod = mon.filter(l => !decom.has(l.uuid));
+  const worst = prod.reduce((a, b) => (b.availability < a.availability ? b : a), prod[0]);
+  if (worst) kpis.push(["Lowest link availability", worst.availability.toFixed(2), "%",
+    `${esc(worst.name)} · ${prod.reduce((t, l) => t + l.outages.length, 0)} outages in ${R.days} days`]);
+}
 kpis.push(["Footprint", F.active, " links", `${F.routers} Cloud Router · ${F.neNodes}-node firewall`]);
 $("kpis").innerHTML = kpis.map(([label, num, unit, sub]) =>
   `<div class="kpi"><span class="eyebrow">${label}</span><span class="num">${esc(num)}${unit ? `<small>${esc(unit)}</small>` : ""}</span><span class="sub">${sub}</span></div>`).join("");
 
 const ICON = {good: "✓", warn: "!", info: "i"};
-$("findings").innerHTML = D.findings.map(f =>
-  `<div class="finding ${f.tone}"><span class="icon" aria-hidden="true">${ICON[f.tone]}</span><h3>${esc(f.title)}</h3><p>${esc(f.body)}</p></div>`).join("");
+const findingCard = f => `<div class="finding ${f.tone}"><span class="icon" aria-hidden="true">${ICON[f.tone]}</span><h3>${esc(f.title)}</h3><p>${esc(f.body)}</p></div>`;
+const TOP = 6;
+$("findings").innerHTML = D.findings.slice(0, TOP).map(findingCard).join("");
+if (D.findings.length > TOP) {
+  $("more-findings").hidden = false;
+  $("more-findings").querySelector("summary").textContent = `${D.findings.length - TOP} more findings`;
+  $("findings-more").innerHTML = D.findings.slice(TOP).map(findingCard).join("");
+}
 
 /* ---------- spend: stacked columns ---------- */
 function drawSpend() {
@@ -764,7 +887,7 @@ if (S && S.links.length) {
   $("size-sub").textContent = `${money(S.monthly_savings)}/mo · ${money(S.monthly_savings * 12)}/yr`;
   const hdr = ["Link", "Cloud", "Action", "Current", "Pair peak", "Needed", "Recommended", "Cost now", "Cost after", "Savings / mo"];
   $("size-table").innerHTML = `<thead><tr>${hdr.map((h, i) => `<th class="${i >= 3 ? "num" : ""}">${h}</th>`).join("")}</tr></thead><tbody>` +
-    S.links.map(r => `<tr><td class="name">${esc(r.name)}</td><td>${cloudChip(r.cloud)}</td><td><span class="pill ${ACT[r.action][0]}">${ACT[r.action][1]}</span></td>
+    S.links.map(r => `<tr><td class="name">${esc(r.name)}</td><td>${cloudChip(r.cloud)}</td><td><span class="pill ${ACT[r.action][0]}">${ACT[r.action][1]}</span>${r.action === "decommission" && r.prefixes && r.prefixes.length ? `<span class="prefix-note">Still carries ${esc(r.prefixes.join(", "))}</span>` : ""}</td>
       <td class="num">${bw(r.bandwidth)}</td><td class="num">${mbps(r.combined_peak)}</td><td class="num">${mbps(r.needed)}</td>
       <td class="num"><b>${r.recommended ? bw(r.recommended) : "—"}</b></td><td class="num">${money(r.current_cost)}</td><td class="num">${money(r.new_cost)}</td>
       <td class="num ${r.savings > 0 ? "saving" : ""}">${money(r.savings)}</td></tr>`).join("") +
@@ -779,6 +902,95 @@ if (S && S.links.length) {
   ].map(t => `<li>${t}</li>`).join("");
 } else {
   $("size-table").innerHTML = `<tbody><tr><td class="empty">No right-sizing data for this run.</td></tr></tbody>`;
+}
+
+/* ---------- reliability ---------- */
+const dur = s => s < 90 ? `${Math.round(s)} s` : s < 5400 ? `${Math.round(s / 60)} min` : `${(s / 3600).toFixed(1)} h`;
+const when = iso => new Date(iso).toLocaleString("en-US", {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC"});
+if (R) {
+  const mon = R.links.filter(l => l.monitored);
+  const t0 = new Date(R.start).getTime(), t1 = new Date(R.end).getTime();
+  $("rel-sub").textContent = `${mon.length} BGP sessions · last ${R.days} days`;
+  const drawTimeline = () => {
+    const host = $("timeline");
+    host.replaceChildren();
+    const W = host.clientWidth, lane = 30, m = {t: 18, r: 8, b: 24, l: Math.min(190, W * 0.38)};
+    const H = m.t + m.b + lane * mon.length, iw = W - m.l - m.r;
+    const x = t => m.l + (t - t0) / (t1 - t0) * iw;
+    const svg = svgEl("svg", {viewBox: `0 0 ${W} ${H}`, height: H, role: "img", "aria-label": "BGP session outages and flaps per link"}, host);
+    const g = svgEl("g", {class: "grid"}, svg), ax = svgEl("g", {class: "axis"}, svg);
+    for (let d = new Date(t0); d.getTime() <= t1; d.setUTCDate(d.getUTCDate() + 1)) {
+      if (d.getUTCDate() !== 1) continue;
+      const day = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1);
+      if (day < t0) continue;
+      svgEl("line", {x1: x(day), x2: x(day), y1: m.t, y2: H - m.b}, g);
+      svgEl("text", {x: x(day), y: H - 6, "text-anchor": "middle"}, ax).textContent = new Date(day).toLocaleString("en-US", {month: "short", timeZone: "UTC"});
+    }
+    const tip = tooltip(host);
+    const hover = (el, head, rows) => {
+      el.setAttribute("tabindex", 0);
+      const show = ev => { const r = host.getBoundingClientRect(); const b = el.getBoundingClientRect();
+        tip.show((ev && ev.clientX ? ev.clientX : b.left + b.width / 2) - r.left, b.top - r.top, head, rows); };
+      el.addEventListener("pointerenter", show); el.addEventListener("focus", () => show());
+      el.addEventListener("pointerleave", tip.hide); el.addEventListener("blur", tip.hide);
+    };
+    R.network_resets.forEach(iso => {
+      const xx = x(new Date(iso).getTime());
+      svgEl("line", {class: "reset-line", x1: xx, x2: xx, y1: m.t - 6, y2: H - m.b}, svg);
+      const mk = svgEl("path", {d: `M${xx - 4},${m.t - 12}L${xx + 4},${m.t - 12}L${xx},${m.t - 5}Z`, fill: "var(--muted)"}, svg);
+      hover(mk, when(iso) + " UTC", [[null, "Network-wide reset", "all sessions"]]);
+    });
+    mon.forEach((l, i) => {
+      const y = m.t + lane * i + lane / 2;
+      svgEl("line", {class: "baseline", x1: m.l, x2: W - m.r, y1: y, y2: y}, svg);
+      const lab = svgEl("text", {class: "lane-label", x: m.l - 10, y: y + 4, "text-anchor": "end"}, svg);
+      lab.textContent = l.name.length > 26 && m.l < 180 ? l.name.slice(0, 24) + "…" : l.name;
+      l.flaps.forEach(f => {
+        const xx = x(new Date(f.start).getTime());
+        const mk = svgEl("rect", {class: "status-warn", x: xx - 1.5, y: y - 7, width: 3, height: 14, rx: 1.5}, svg);
+        hover(mk, l.name, [[cssVar("--warn-mark"), "Flap", dur(f.seconds)], [null, "At", when(f.start) + " UTC"]]);
+      });
+      l.outages.forEach(o => {
+        const a = x(new Date(o.start).getTime()), b = x(new Date(o.end).getTime());
+        const w = Math.max(8, b - a);
+        const mk = svgEl("rect", {class: "status-crit", x: a - (w - (b - a)) / 2, y: y - 9, width: w, height: 18, rx: 4,
+          stroke: "var(--surface)", "stroke-width": 2}, svg);
+        hover(mk, l.name, [[cssVar("--crit"), "Outage", dur(o.seconds)], [null, "From", when(o.start) + " UTC"],
+          [null, "Link status", o.link_down ? "went down" : "stayed up"]]);
+      });
+    });
+  };
+  onResize($("timeline"), drawTimeline);
+  $("timeline-legend").innerHTML = `<span><span class="sw" style="background:var(--crit);width:16px"></span>Outage (${R.flap_seconds} s or longer)</span>
+    <span><span class="sw" style="background:var(--warn-mark);width:3px;height:12px"></span>Flap (under ${R.flap_seconds} s)</span>
+    <span><span style="color:var(--muted)">▼</span>Network-wide reset</span>`;
+  $("timeline-note").textContent = R.network_resets.length
+    ? `${R.network_resets.length} network-wide resets (${R.network_resets.map(t => when(t).split(",")[0]).join(", ")}): every session re-established at once with no drop recorded, consistent with Equinix platform maintenance.`
+    : "";
+  const hdr = ["Link", "Cloud", "Now", "Availability", "Outages", "Downtime", "Longest drop", "Flaps", "BFD"];
+  const rows = [...mon].sort((a, b) => a.availability - b.availability);
+  $("rel-table").innerHTML = `<thead><tr>${hdr.map((h, i) => `<th class="${i >= 3 && i <= 7 ? "num" : ""}">${h}</th>`).join("")}</tr></thead><tbody>` +
+    rows.map(l => `<tr><td class="name">${esc(l.name)}</td><td>${cloudChip(l.cloud)}</td>
+      <td>${l.status ? `<span class="pill ${l.status === "UP" ? "ok" : "warn"}">${esc(l.status)}</span>` : "—"}</td>
+      <td class="num"><b>${l.availability.toFixed(3)}%</b></td><td class="num">${l.outages.length}</td><td class="num">${dur(l.downtime_seconds)}</td>
+      <td class="num">${l.longest_seconds ? dur(l.longest_seconds) : "—"}</td><td class="num">${l.flaps.length}</td>
+      <td>${l.bfd == null ? "—" : `<span class="pill ${l.bfd ? "ok" : "off"}">${l.bfd ? "On" : "Off"}</span>`}</td></tr>`).join("") + "</tbody>";
+} else {
+  $("rel-table").innerHTML = `<tbody><tr><td class="empty">Event data wasn't available for this run.</td></tr></tbody>`;
+  $("timeline").innerHTML = "";
+}
+
+/* ---------- routing ---------- */
+if (D.routes && D.routes.length) {
+  const single = D.routes.filter(r => !r.redundant).length;
+  $("route-sub").textContent = `${D.routes.length} networks · ${single ? single + " without a backup path" : "all with a backup path"}`;
+  $("route-table").innerHTML = `<thead><tr><th>Network</th><th>Cloud</th><th>Backup path</th><th>Learned via</th><th>Next hops</th><th class="num">Origin ASN</th></tr></thead><tbody>` +
+    D.routes.map(r => `<tr><td class="mono name">${esc(r.prefix)}</td><td>${cloudChip(r.cloud)}</td>
+      <td><span class="pill ${r.redundant ? "ok" : "warn"}">${r.redundant ? r.paths.length + " paths" : "Single path"}</span></td>
+      <td>${r.paths.map(p => esc(p.connection)).join("<br>")}</td><td class="mono">${r.paths.map(p => esc(p.next_hop)).join("<br>")}</td>
+      <td class="num mono">${esc(r.origin_asn)}</td></tr>`).join("") + "</tbody>";
+} else {
+  $("route-table").innerHTML = `<tbody><tr><td class="empty">Route data wasn't available for this run.</td></tr></tbody>`;
 }
 
 /* ---------- inventory tables ---------- */
@@ -877,6 +1089,6 @@ function segment(el) {
 document.querySelectorAll(".seg").forEach(segment);
 $("conn-search").oninput = e => { state.connections.q = e.target.value.trim(); render("connections"); };
 Object.keys(TABLES).forEach(render);
-$("foot").textContent = "Source: Equinix Fabric v4 (connections, Cloud Routers, statistics, prices), Network Edge v1 and Billing v2 APIs, via collect_fabric_inventory.py. Amounts in " + (B ? B.currency : "USD") + ", before tax unless noted.";
+$("foot").textContent = "Source: Equinix Fabric v4 (connections, Cloud Routers, routes, routing protocols, statistics, Cloud Events, prices), Network Edge v1 and Billing v2 APIs, via collect_fabric_inventory.py. Amounts in " + (B ? B.currency : "USD") + ", before tax unless noted.";
 </script>
 """

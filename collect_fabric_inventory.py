@@ -25,8 +25,9 @@ import urllib.request
 from dotenv import load_dotenv
 from equinix.services import fabricv4
 
-from insights import (INVOICE_FIELDS, rightsizing, scrub, summarize_billing,
-                      summarize_stats, trim_lines)
+from insights import (INVOICE_FIELDS, bgp_health, bgp_settings, rightsizing,
+                      route_table, scrub, summarize_billing, summarize_stats,
+                      trim_lines)
 from report import render_html
 
 load_dotenv()
@@ -43,6 +44,9 @@ ROUTER_STATES = ["PROVISIONED", "PROVISIONING", "NOT_PROVISIONED",
 # considered active (including in-flight states like PROVISIONING).
 INACTIVE_STATES = {"DEPROVISIONED", "DELETED", "NOT_PROVISIONED"}
 PRICE_TIERS = [50, 100, 200, 500, 1000, 2000, 5000, 10000]
+ROUTE_TYPES = ["IPv4_BGP_ROUTE", "IPv4_STATIC_ROUTE", "IPv4_DIRECT_ROUTE",
+               "IPv6_BGP_ROUTE", "IPv6_STATIC_ROUTE", "IPv6_DIRECT_ROUTE"]
+EVENT_DAYS = 89
 
 
 def log(msg):
@@ -88,7 +92,8 @@ def collect(name, fetch, default=list):
     except Exception as e:  # noqa: BLE001 - report and keep going
         log(f"[{name}] FAILED: {e}")
         return default()
-    log(f"[{name}] OK - {len(items)} found")
+    found = len(items[0] if isinstance(items, tuple) else items)
+    log(f"[{name}] OK - {found} found")
     return items
 
 
@@ -112,7 +117,8 @@ def get_connections(client):
                 offset=offset, limit=PAGE_SIZE))
         status, body = read_json(
             api.search_connections_without_preload_content(search))
-        page = body.get("data") or []
+        # scrub() drops Google pairing keys / AWS account IDs (authenticationKey)
+        page = [scrub(c) for c in body.get("data") or []]
         total = (body.get("pagination") or {}).get("total", len(page))
         log(f"[connections] HTTP {status} - offset {offset}: "
             f"{len(page)} of {total}")
@@ -203,6 +209,68 @@ def get_billing(token, account_number, names):
     lines = paged("billing", token,
                   f"/v2/invoices/details?accountNumber={account_number}")
     return invoices, trim_lines(lines, names)
+
+
+def get_events(token, project_ids, days):
+    """Cloud Events (BGP session and connection state changes). The API only
+    keeps 90 days, so the window is capped just under that."""
+    end = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    start = end - datetime.timedelta(days=min(days, EVENT_DAYS))
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    events = []
+    for project in project_ids:
+        offset = 0
+        while True:
+            status, body = rest(token, "/fabric/v4/cloudevents/search", "POST", {
+                "filter": {"and": [
+                    {"property": "/equinixproject", "operator": "=",
+                     "values": [project]},
+                    {"property": "/time", "operator": "BETWEEN",
+                     "values": [start.strftime(fmt), end.strftime(fmt)]}]},
+                "pagination": {"offset": offset, "limit": PAGE_SIZE}})
+            page = body.get("data") or []
+            total = (body.get("pagination") or {}).get("total", len(page))
+            log(f"[events] HTTP {status} - offset {offset}: {len(page)} of {total}")
+            events += [scrub(e) for e in page]
+            offset += PAGE_SIZE
+            if not page or offset >= total:
+                break
+    return events, start, end
+
+
+def get_routes(token, routers):
+    """Active route table of each Cloud Router."""
+    routes = []
+    for r in routers:
+        offset = 0
+        while True:
+            status, body = rest(token, f"/fabric/v4/routers/{r['uuid']}/routes/search",
+                                "POST", {
+                "filter": {"and": [{"property": "/type", "operator": "IN",
+                                    "values": ROUTE_TYPES}]},
+                "pagination": {"offset": offset, "limit": PAGE_SIZE}})
+            page = body.get("data") or []
+            total = (body.get("pagination") or {}).get("total", len(page))
+            log(f"[routes] HTTP {status} - {r.get('name')}: {len(page)} of {total}")
+            routes += page
+            offset += PAGE_SIZE
+            if not page or offset >= total:
+                break
+    return routes
+
+
+def get_routing_protocols(token, conns):
+    """BGP settings per connection; scrub() removes the BGP auth keys."""
+    result = {}
+    for c in conns:
+        try:
+            status, body = rest(token, f"/fabric/v4/connections/{c['uuid']}/routingProtocols")
+        except RuntimeError as e:
+            log(f"[bgp] skipped {c.get('name')}: {str(e)[:120]}")
+            continue
+        result[c["uuid"]] = scrub(body.get("data") or [])
+        log(f"[bgp] HTTP {status} - {c.get('name')}: {len(result[c['uuid']])} protocols")
+    return result
 
 
 def get_prices(token, metro):
@@ -332,7 +400,7 @@ def money(value):
     return f"${value:,.0f}"
 
 
-def print_insights(util, billing, sizing):
+def print_insights(util, billing, sizing, health, routes):
     table("Utilization (active connections)",
           ["Name", "Cloud", "Capacity", "Peak Mbps", "p95 Mbps", "Peak %"],
           [[u["name"], u["cloud"], f"{u['bandwidth']} Mbps", f"{u['peak']:.1f}",
@@ -345,6 +413,22 @@ def print_insights(util, billing, sizing):
         table("Current month by item", ["Item", "Category", "Amount"],
               [[i["item"], i["category"], money(i["amount"])]
                for i in billing["current_items"]])
+    if health:
+        table("BGP reliability (last %d days)" % health["days"],
+              ["Link", "Outages", "Flaps", "Downtime", "Longest", "Availability",
+               "BFD"],
+              [[h["name"], len(h["outages"]), len(h["flaps"]),
+                f"{h['downtime_seconds'] // 60} min", f"{h['longest_seconds']} s",
+                f"{h['availability']:.3f}%", "on" if h.get("bfd") else "off"]
+               for h in health["links"] if h["monitored"]])
+        if health["network_resets"]:
+            log("Network-wide session resets: " + ", ".join(
+                t[:16] for t in health["network_resets"]))
+    if routes:
+        table("Cloud Router routes", ["Prefix", "Paths", "Via", "Origin AS"],
+              [[r["prefix"], len(r["paths"]),
+                ", ".join(p["connection"] for p in r["paths"]), r["origin_asn"]]
+               for r in routes])
     if sizing and sizing["links"]:
         table(f"Right-sizing (pair peak x {sizing['headroom']} headroom)",
               ["Link", "Current", "Pair peak", "Action", "Recommended",
@@ -399,15 +483,36 @@ def main():
     prices = collect("prices", lambda: get_prices(token, metro))
     sizing = rightsizing(util, prices, billing["current_items"] if billing else [])
 
+    active = conns["active"]
+    projects = sorted({get(c, "project/projectId") for c in active} - {""})
+    events, ev_start, ev_end = collect(
+        "events", lambda: get_events(token, projects, args.days),
+        default=lambda: ([], None, None))
+    protocols = collect("bgp", lambda: get_routing_protocols(token, active),
+                        default=dict)
+    settings = bgp_settings(protocols, active)
+    health = None
+    if ev_start:
+        health = bgp_health(events, [c for c in active if c["uuid"] in protocols],
+                            ev_start, ev_end)
+        health["days"] = (ev_end - ev_start).days
+        bfd = {s["uuid"]: s for s in settings}
+        for h in health["links"]:
+            h.update({k: bfd.get(h["uuid"], {}).get(k) for k in
+                      ("bfd", "customer_asn", "status", "since")})
+    routes = route_table(collect("routes", lambda: get_routes(
+        token, routers["active"])), conns["active"])
+
     inventory = {"ports": ports, "connections": conns,
                  "cloud_routers": routers, "network_edge_devices": devices,
                  "utilization": {"days": args.days, "connections": util},
-                 "billing": billing, "rightsizing": sizing}
+                 "billing": billing, "rightsizing": sizing,
+                 "reliability": health, "routes": routes}
     json.dump(inventory, sys.stdout, indent=2, default=str)
     print()
 
     print_tables(routers, conns, devices)
-    print_insights(util, billing, sizing)
+    print_insights(util, billing, sizing, health, routes)
     log(f"\n# {len(ports)} ports | connections: "
         f"{len(conns['active'])} active, {len(conns['deprovisioned'])} "
         f"deprovisioned | cloud routers: {len(routers['active'])} active, "
