@@ -1,6 +1,16 @@
-"""Render the Fabric / Network Edge inventory as a self-contained HTML report."""
+"""Render the Equinix inventory, spend and utilization as a self-contained HTML
+report aimed at leadership: summary first, detail further down."""
 import datetime
 import json
+from collections import defaultdict
+
+from insights import CATEGORIES
+
+CLOUD_NAMES = {"aws": "AWS", "gcp": "Google Cloud", "azure": "Azure",
+               "oracle": "Oracle", "internet": "Internet", "other": "Other"}
+# Cloud-side attachment sizes; a link plateauing just under one of these
+# (below its own Equinix bandwidth) suggests the cloud side is the bottleneck.
+CLOUD_SIDE_SIZES = [1000, 2000, 5000]
 
 
 def get(obj, path, default=""):
@@ -9,6 +19,20 @@ def get(obj, path, default=""):
         obj = obj.get(key) if isinstance(obj, dict) else None
     return default if obj is None else obj
 
+
+def money(value):
+    return f"${value:,.0f}"
+
+
+def bandwidth(mbps):
+    return f"{mbps / 1000:g} Gbps" if mbps >= 1000 else f"{mbps:g} Mbps"
+
+
+def month_name(month):
+    return datetime.date.fromisoformat(month + "-01").strftime("%b %Y")
+
+
+# ------------------------------------------------------------------ inventory
 
 def endpoint(side):
     ap = get(side, "accessPoint", {})
@@ -21,9 +45,9 @@ def endpoint(side):
 def connection_row(c, lifecycle):
     return {
         "lifecycle": lifecycle,
+        "uuid": c.get("uuid"),
         "name": c.get("name"),
         "status": get(c, "operation/equinixStatus"),
-        "provider": get(c, "operation/providerStatus"),
         "type": c.get("type"),
         "cloud": c.get("cloud"),
         "mbps": c.get("bandwidth") or 0,
@@ -54,8 +78,10 @@ def router_row(r, lifecycle):
 
 
 def device_row(d):
+    nodes = get(d, "clusterDetails/nodes", [])
     return {
-        "name": d.get("name"),
+        "name": get(d, "clusterDetails/clusterName") or d.get("name"),
+        "nodes": ", ".join(n.get("name", "") for n in nodes) or d.get("name"),
         "status": d.get("status"),
         "type": d.get("deviceTypeName") or d.get("deviceTypeCode"),
         "vendor": d.get("deviceTypeVendor"),
@@ -66,18 +92,196 @@ def device_row(d):
     }
 
 
+# ---------------------------------------------------------------- utilization
+
+def utilization_rows(util, costs):
+    """Per-link summary plus hourly series aligned to one shared time axis."""
+    links = [u for u in util if u["series"]["hours"]]
+    if not links:
+        return None
+    parse = lambda h: datetime.datetime.fromisoformat(h.replace("Z", "+00:00"))
+    start = min(parse(u["series"]["hours"][0]) for u in links)
+    end = max(parse(u["series"]["hours"][-1]) for u in links)
+    n = int((end - start).total_seconds() // 3600) + 1
+    rows = []
+    for u in links:
+        inbound, outbound = [None] * n, [None] * n
+        for h, i, o in zip(u["series"]["hours"], u["series"]["in"],
+                           u["series"]["out"]):
+            idx = int((parse(h) - start).total_seconds() // 3600)
+            inbound[idx], outbound[idx] = round(i, 1), round(o, 1)
+        rows.append({
+            "uuid": u["uuid"], "name": u["name"], "cloud": u["cloud"],
+            "bandwidth": u["bandwidth"], "priority": u.get("priority"),
+            "peak": round(u["peak"], 1), "p95": round(u["p95"], 1),
+            "mean": round(max(u["inbound"]["mean"], u["outbound"]["mean"]), 2),
+            "peak_pct": u["peak_pct"], "cost": costs.get(u["uuid"]),
+            "in": inbound, "out": outbound,
+        })
+    order = {"aws": 0, "gcp": 1}
+    rows.sort(key=lambda r: (order.get(r["cloud"], 9), -r["bandwidth"],
+                             r["priority"] != "PRIMARY"))
+    return {"start": start.isoformat().replace("+00:00", "Z"), "hours": n,
+            "links": rows}
+
+
+def peak_days(util_rows, top=3):
+    """Dates of the biggest bursts that hit AWS and Google links at once (at
+    least half the largest burst on each side)."""
+    if not util_rows:
+        return []
+    start = datetime.datetime.fromisoformat(util_rows["start"].replace("Z", "+00:00"))
+    per_cloud = cloud_totals(util_rows)
+    if len(per_cloud) < 2:
+        return []
+    clouds = list(per_cloud.values())
+    peaks = [max(c) for c in clouds]
+    days = {}
+    for idx in sorted(range(util_rows["hours"]), key=lambda i: -sum(c[i] for c in clouds)):
+        if any(c[idx] < 0.5 * p for c, p in zip(clouds, peaks)):
+            continue
+        when = start + datetime.timedelta(hours=idx)
+        days.setdefault(when.date(), when.hour)
+        if len(days) == top:
+            break
+    return [(d.strftime("%b %-d"), h) for d, h in sorted(days.items())]
+
+
+def cloud_totals(util_rows):
+    """Hourly combined traffic per cloud (busier direction on each link)."""
+    totals = {}
+    for link in util_rows["links"]:
+        if link["cloud"] not in ("aws", "gcp"):
+            continue
+        series = totals.setdefault(link["cloud"], [0.0] * util_rows["hours"])
+        for idx, (i, o) in enumerate(zip(link["in"], link["out"])):
+            series[idx] += max(i or 0, o or 0)
+    return totals
+
+
+# ------------------------------------------------------------------ findings
+
+def findings(billing, util_rows, sizing, active_conns):
+    """Plain-language key findings, most important first."""
+    out = []
+    if billing and billing["monthly"]:
+        first, last = billing["monthly"][0], billing["monthly"][-1]
+        change = last["total_charges"] - first["total_charges"]
+        if first["total_charges"] and abs(change) / first["total_charges"] >= 0.05:
+            pct = abs(change) / first["total_charges"] * 100
+            out.append(("good" if change < 0 else "warn",
+                        f"Monthly spend is {'down' if change < 0 else 'up'} {pct:.0f}%",
+                        f"{money(last['total_charges'])} in {month_name(last['month'])}, "
+                        f"compared with {money(first['total_charges'])} in "
+                        f"{month_name(first['month'])}."))
+        cats = last["charges"]
+        top_cat = max(cats, key=cats.get)
+        if last["total_charges"]:
+            share = cats[top_cat] / last["total_charges"] * 100
+            out.append(("info", f"{top_cat} is {share:.0f}% of monthly spend",
+                        f"{money(cats[top_cat])} of {money(last['total_charges'])} "
+                        f"on the {month_name(last['month'])} invoice."))
+    if sizing and sizing["monthly_savings"] > 0:
+        idle = [r for r in sizing["links"] if r["action"] == "decommission"]
+        down = [r for r in sizing["links"] if r["action"] == "downsize"]
+        parts = []
+        if idle:
+            parts.append(f"decommissioning {len(idle)} idle links "
+                         f"({', '.join(r['name'] for r in idle)})")
+        if down:
+            tiers = sorted({(r["bandwidth"], r["recommended"]) for r in down})
+            parts.append(f"downsizing {len(down)} links "
+                         f"({'; '.join(f'{bandwidth(a)} to {bandwidth(b)}' for a, b in tiers)})")
+        out.append(("good", f"Save about {money(sizing['monthly_savings'])} per month "
+                    f"({money(sizing['monthly_savings'] * 12)} per year)",
+                    "By " + " and ".join(parts) + ", while keeping enough capacity "
+                    "for one link to carry its pair's peak traffic."))
+    if util_rows:
+        links = util_rows["links"]
+        busiest = max(links, key=lambda r: r["peak_pct"])
+        out.append(("info", "Cloud links run far below capacity",
+                    f"The busiest link, {busiest['name']}, peaked at "
+                    f"{busiest['peak_pct']:.1f}% of its {bandwidth(busiest['bandwidth'])}. "
+                    f"Typical (95th percentile) load is at most "
+                    f"{max(r['p95'] for r in links):.1f} Mbps on any link."))
+        days = peak_days(util_rows)
+        if days:
+            out.append(("info", "Traffic comes in short bursts",
+                        "The largest bursts were on " + " and ".join(
+                            f"{d} ({h:02d}:00 UTC)" for d, h in days) +
+                        ", on AWS and Google links at the same time, which "
+                        "points to scheduled cloud-to-cloud transfers."))
+        capped = [(r, size) for r in links for size in CLOUD_SIDE_SIZES
+                  if size < r["bandwidth"] and 0.9 * size <= r["peak"] <= size]
+        if len(capped) >= 2:
+            size = bandwidth(min(s for _, s in capped))
+            out.append(("warn", "Links may be capped on the cloud side",
+                        f"{len(capped)} links top out just under {size} although they "
+                        "are provisioned at more than that on Equinix. Check whether the "
+                        f"AWS hosted connections or Google VLAN attachments are {size}; "
+                        "that would limit transfers whatever the Equinix tier."))
+    measured = {r["uuid"] for r in (util_rows or {}).get("links", [])}
+    skipped = [c for c in active_conns if c["a"]["kind"] == "VD"
+               and c.get("uuid") not in measured]
+    if skipped:
+        out.append(("info", "Some links have no utilization data",
+                    f"Equinix doesn't report statistics for connections that start "
+                    f"at a Network Edge device ({', '.join(c['name'] for c in skipped)})."))
+    return [{"tone": t, "title": a, "body": b} for t, a, b in out]
+
+
+# ---------------------------------------------------------------------- build
+
 def build_data(inventory):
     conns, routers = inventory["connections"], inventory["cloud_routers"]
+    billing = inventory.get("billing") or None
+    sizing = inventory.get("rightsizing") or None
+    util = (inventory.get("utilization") or {}).get("connections") or []
+    costs = {i["uuid"]: i["amount"] for i in (billing or {}).get("current_items", [])
+             if i.get("uuid")}
+    util_rows = utilization_rows(util, costs)
+    conn_rows = [connection_row(c, s) for s in ("active", "deprovisioned")
+                 for c in conns[s]]
+    active = [r for r in conn_rows if r["lifecycle"] == "active"]
+    cloud_links = [r for r in active if r["cloud"] in ("aws", "gcp")]
+    devices = [device_row(d) for d in inventory["network_edge_devices"]]
+    node_count = sum(len(get(d, "clusterDetails/nodes", [])) or 1
+                     for d in inventory["network_edge_devices"])
+    # Busiest cloud's combined peak; AWS and Google aren't added together
+    # because cloud-to-cloud traffic crosses both and would count twice.
+    peak_total = max((max(series) for series in
+                      cloud_totals(util_rows).values()), default=0) if util_rows else 0
     return {
-        "generated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "generated": datetime.datetime.now().strftime("%b %-d, %Y %H:%M"),
         "account": next((get(r, "account/accountName") for state in routers
                          for r in routers[state]), ""),
+        "days": (inventory.get("utilization") or {}).get("days"),
         "ports": len(inventory["ports"]),
-        "connections": [connection_row(c, s) for s in ("active", "deprovisioned")
-                        for c in conns[s]],
+        "categories": CATEGORIES,
+        "billing": billing and {
+            "currency": billing["currency"],
+            "runRate": billing["run_rate"],
+            "last12": billing["last12_total"],
+            "credits": billing["last12_credits"],
+            "latest": (billing.get("latest_invoice") or {}).get("transactionDate"),
+            "monthly": billing["monthly"],
+            "items": billing["current_items"],
+        },
+        "util": util_rows,
+        "sizing": sizing,
+        "findings": findings(billing, util_rows, sizing, active),
+        "footprint": {
+            "active": len(active),
+            "cloudLinks": len(cloud_links),
+            "cloudCapacity": sum(r["mbps"] for r in cloud_links),
+            "peakCloud": round(peak_total, 1),
+            "routers": len(routers["active"]),
+            "neNodes": node_count,
+        },
+        "connections": conn_rows,
         "routers": [router_row(r, s) for s in ("active", "deprovisioned")
                     for r in routers[s]],
-        "devices": [device_row(d) for d in inventory["network_edge_devices"]],
+        "devices": devices,
     }
 
 
@@ -86,147 +290,233 @@ def render_html(inventory):
     return TEMPLATE.replace("__DATA__", data)
 
 
-TEMPLATE = r"""<title>Equinix Fabric Inventory</title>
+TEMPLATE = r"""<title>Equinix Interconnect Report</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
 <style>
-/* Layout: summary strip, then topology-ordered sections (edge -> router -> circuits), tables scroll inside their own frames. */
+/* Layout: one column, leadership summary first (KPIs, findings), then spend, utilization, right-sizing, inventory. Charts scale to their card width. */
 :root {
-  --bg: #f5f7f8; --surface: #ffffff; --fg: #17212b; --muted: #5d6b78; --line: #dde3e8;
-  --accent: #0b6e85; --accent-soft: #e2f1f4;
-  --ok: #1f7a4a; --ok-soft: #e3f3ea; --off: #6b7580; --off-soft: #eceff2;
-  --warn: #9a5b00; --warn-soft: #fbf0dc;
-  --aws: #b35c00; --aws-soft: #fdeedd; --gcp: #2457c5; --gcp-soft: #e4ecfb;
-  --inet: #6b46b8; --inet-soft: #efe9fa; --other: #48606f; --other-soft: #e7edf0;
+  --bg: #f4f6f7; --surface: #ffffff; --fg: #141c24; --fg2: #46535f; --muted: #6f7b86;
+  --line: #e1e5e8; --axis: #c3c9ce; --accent: #0b6e85; --accent-soft: #e2f1f4;
+  --good: #0f7a3d; --good-soft: #e2f3e8; --warn: #9a5b00; --warn-soft: #fbf0dc;
+  --off: #6b7580; --off-soft: #eceff2;
+  /* categorical slots 1-5, validated order */
+  --c-gcp: #2a78d6; --c-aws: #eb6834; --c-ne: #1baf7a; --c-cr: #eda100; --c-inet: #e87ba4; --c-other: #9aa3ab;
   --display: "IBM Plex Sans Condensed", "Arial Narrow", sans-serif;
   --body: "IBM Plex Sans", system-ui, sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
 }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
-  --bg: #0f161c; --surface: #162029; --fg: #e4eaef; --muted: #93a2ae; --line: #26333e;
-  --accent: #4fc0d8; --accent-soft: #143440;
-  --ok: #5fcf8f; --ok-soft: #15332a; --off: #8d98a2; --off-soft: #222c35;
-  --warn: #f0b45a; --warn-soft: #3a2b12;
-  --aws: #ffad5c; --aws-soft: #3b2814; --gcp: #82a8ff; --gcp-soft: #1b2a4a;
-  --inet: #b79cf2; --inet-soft: #2b2342; --other: #a9bcc8; --other-soft: #22303a;
+  --bg: #0e1418; --surface: #161e25; --fg: #e8edf1; --fg2: #b4c0ca; --muted: #8b98a3;
+  --line: #26313a; --axis: #3a4650; --accent: #4fc0d8; --accent-soft: #143440;
+  --good: #3fcf78; --good-soft: #14321f; --warn: #f0b45a; --warn-soft: #3a2b12;
+  --off: #8d98a2; --off-soft: #222c35;
+  --c-gcp: #3987e5; --c-aws: #d95926; --c-ne: #199e70; --c-cr: #c98500; --c-inet: #d55181; --c-other: #6c7680;
   color-scheme: dark; } }
 :root[data-theme="dark"] {
-  --bg: #0f161c; --surface: #162029; --fg: #e4eaef; --muted: #93a2ae; --line: #26333e;
-  --accent: #4fc0d8; --accent-soft: #143440;
-  --ok: #5fcf8f; --ok-soft: #15332a; --off: #8d98a2; --off-soft: #222c35;
-  --warn: #f0b45a; --warn-soft: #3a2b12;
-  --aws: #ffad5c; --aws-soft: #3b2814; --gcp: #82a8ff; --gcp-soft: #1b2a4a;
-  --inet: #b79cf2; --inet-soft: #2b2342; --other: #a9bcc8; --other-soft: #22303a;
+  --bg: #0e1418; --surface: #161e25; --fg: #e8edf1; --fg2: #b4c0ca; --muted: #8b98a3;
+  --line: #26313a; --axis: #3a4650; --accent: #4fc0d8; --accent-soft: #143440;
+  --good: #3fcf78; --good-soft: #14321f; --warn: #f0b45a; --warn-soft: #3a2b12;
+  --off: #8d98a2; --off-soft: #222c35;
+  --c-gcp: #3987e5; --c-aws: #d95926; --c-ne: #199e70; --c-cr: #c98500; --c-inet: #d55181; --c-other: #6c7680;
   color-scheme: dark; }
 
 * { box-sizing: border-box; }
 body { background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 14px;
-  line-height: 1.5; padding-inline: 16px; padding-block: 28px 48px; }
-.wrap { max-width: 1240px; margin-inline: auto; display: grid; gap: 28px; }
-header { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 12px; }
-h1 { font-family: var(--display); font-weight: 600; font-size: 30px; line-height: 1.1;
-  margin: 0; text-wrap: balance; letter-spacing: -0.01em; }
-.meta { color: var(--muted); font-size: 13px; display: flex; flex-wrap: wrap; gap: 4px 16px; }
-.meta b { color: var(--fg); font-weight: 500; }
-h2 { font-family: var(--display); font-weight: 600; font-size: 19px; margin: 0; }
+  line-height: 1.5; padding-inline: 16px; padding-block: 28px 56px; }
+.wrap { max-width: 1180px; margin-inline: auto; display: grid; gap: 36px; }
+header { display: grid; gap: 14px; }
+.title-row { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 12px; }
+h1 { font-family: var(--display); font-weight: 600; font-size: 34px; line-height: 1.05; margin: 0;
+  letter-spacing: -0.01em; text-wrap: balance; }
+h2 { font-family: var(--display); font-weight: 600; font-size: 22px; margin: 0; text-wrap: balance; }
+h3 { font-size: 13px; font-weight: 600; margin: 0; }
 .eyebrow { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+.meta { color: var(--muted); font-size: 13px; display: flex; flex-wrap: wrap; gap: 4px 18px; }
+.meta b { color: var(--fg); font-weight: 500; }
+nav { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 13px; border-top: 1px solid var(--line); padding-top: 10px; }
+nav a { color: var(--fg2); text-decoration: none; }
+nav a:hover, nav a:focus-visible { color: var(--accent); text-decoration: underline; }
+section { display: grid; gap: 14px; min-width: 0; scroll-margin-top: 16px; }
+.sec-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 16px; }
+.lede { color: var(--fg2); margin: 0; max-width: 72ch; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px; min-width: 0; }
+.card-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; align-items: baseline; margin-bottom: 10px; }
+.card-head .sub { color: var(--muted); font-size: 12.5px; }
+.grid2 { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 16px; }
+@media (max-width: 860px) { .grid2 { grid-template-columns: minmax(0, 1fr); } }
 
-.summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 1px;
+/* KPI strip */
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 1px;
   background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
-.stat { background: var(--surface); padding: 14px 16px; display: grid; gap: 2px; min-width: 0; }
-.stat .num { font-family: var(--display); font-size: 28px; font-weight: 600; line-height: 1.15;
-  font-variant-numeric: tabular-nums; }
-.stat .num small { font-size: 15px; color: var(--muted); font-weight: 500; margin-left: 2px; }
-.stat .sub { color: var(--muted); font-size: 12.5px; }
+.kpi { background: var(--surface); padding: 16px 18px; display: grid; gap: 4px; align-content: start; min-width: 0; }
+.kpi .num { font-family: var(--display); font-size: 32px; font-weight: 600; line-height: 1.1; }
+.kpi .num small { font-size: 15px; font-weight: 500; color: var(--muted); margin-left: 3px; }
+.kpi .sub { color: var(--fg2); font-size: 12.5px; }
+.kpi .delta { font-size: 12.5px; font-weight: 600; }
+.delta.good { color: var(--good); } .delta.warn { color: var(--warn); }
 
-section { display: grid; gap: 12px; min-width: 0; }
-.sec-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
-.sec-title { display: flex; align-items: baseline; gap: 10px; }
-.count { font-family: var(--mono); font-size: 12px; color: var(--muted); }
-.controls { display: flex; flex-wrap: wrap; gap: 6px; }
-.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; background: var(--surface); }
-.seg button { font: inherit; font-size: 12.5px; border: 0; background: transparent; color: var(--muted);
-  padding: 5px 11px; cursor: pointer; }
-.seg button + button { border-left: 1px solid var(--line); }
-.seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
-.seg button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-input[type=search] { font: inherit; font-size: 13px; padding: 5px 10px; border: 1px solid var(--line);
-  border-radius: 7px; background: var(--surface); color: var(--fg); min-width: 0; width: 200px; max-width: 100%; }
+/* Findings */
+.findings { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.finding { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
+  display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; align-content: start; }
+.finding .icon { grid-row: span 2; width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center;
+  font-size: 13px; font-weight: 700; }
+.finding.good .icon { color: var(--good); background: var(--good-soft); }
+.finding.warn .icon { color: var(--warn); background: var(--warn-soft); }
+.finding.info .icon { color: var(--accent); background: var(--accent-soft); }
+.finding h3 { font-size: 14.5px; line-height: 1.35; }
+.finding p { margin: 0; color: var(--fg2); font-size: 13px; }
 
+/* Charts */
+.chart { position: relative; width: 100%; }
+.chart svg { display: block; width: 100%; overflow: visible; }
+.axis text, .tick { fill: var(--muted); font-size: 11px; font-family: var(--body); font-variant-numeric: tabular-nums; }
+.grid line { stroke: var(--line); stroke-width: 1; }
+.baseline { stroke: var(--axis); stroke-width: 1; }
+.cap-label { fill: var(--fg); font-size: 12px; font-weight: 600; font-family: var(--body); }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 12.5px; color: var(--fg2); margin-top: 10px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+.note { color: var(--muted); font-size: 12.5px; margin: 8px 0 0; }
+.tip { position: absolute; pointer-events: none; z-index: 5; background: var(--surface); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font-size: 12px; min-width: 150px;
+  box-shadow: 0 6px 20px rgba(10, 20, 30, 0.14); display: grid; gap: 3px; }
+.tip .t-head { color: var(--muted); font-size: 11.5px; margin-bottom: 2px; }
+.tip .t-row { display: flex; align-items: center; gap: 6px; }
+.tip .t-row b { margin-left: auto; padding-left: 12px; font-variant-numeric: tabular-nums; }
+.hbars { display: grid; gap: 7px; }
+.hbar { display: grid; grid-template-columns: minmax(0, 11.5em) minmax(0, 1fr) auto; gap: 10px; align-items: center;
+  font-size: 12.5px; border-radius: 6px; padding: 1px 2px; }
+.hbar:hover, .hbar:focus-visible { background: color-mix(in srgb, var(--accent-soft) 55%, transparent); outline: none; }
+.hbar .lab { overflow-wrap: anywhere; line-height: 1.25; color: var(--fg2); display: flex; align-items: center; gap: 6px; }
+.hbar .track { height: 14px; }
+.hbar .bar { height: 100%; border-radius: 0 4px 4px 0; min-width: 2px; }
+.hbar .val { font-variant-numeric: tabular-nums; font-weight: 600; text-align: right; min-width: 4.5em; }
+.multiples { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 12px; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px 8px; min-width: 0; }
+.panel-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.panel-head h3 { display: flex; align-items: center; gap: 7px; }
+.panel-head .sub { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+details.tv { margin-top: 10px; }
+details.tv summary { cursor: pointer; color: var(--accent); font-size: 12.5px; width: max-content; }
+
+/* Tables */
 .frame { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; }
+.frame.flat { border: 0; border-radius: 0; }
 table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th { text-align: left; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted);
-  font-weight: 600; padding: 9px 12px; border-bottom: 1px solid var(--line); white-space: nowrap;
-  cursor: pointer; user-select: none; }
+  font-weight: 600; padding: 9px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th.sortable { cursor: pointer; user-select: none; }
 th[aria-sort] { color: var(--accent); }
 th[aria-sort="ascending"]::after { content: " ▲"; font-size: 9px; }
 th[aria-sort="descending"]::after { content: " ▼"; font-size: 9px; }
-td { padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; white-space: nowrap; }
-tr:last-child td { border-bottom: 0; }
-tbody tr:hover td { background: color-mix(in srgb, var(--accent-soft) 45%, transparent); }
+td { padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: middle; white-space: nowrap; }
+tbody tr:last-child td { border-bottom: 0; }
+tfoot td { border-top: 1px solid var(--axis); border-bottom: 0; font-weight: 600; }
+tbody tr:hover td { background: color-mix(in srgb, var(--accent-soft) 40%, transparent); }
 tr.gone td { color: var(--muted); }
 tr.gone td.name { text-decoration: line-through; text-decoration-color: var(--off); }
 .name { font-weight: 600; }
-.mono, td.num, td.date { font-family: var(--mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
-td.num { text-align: right; }
-th.num { text-align: right; }
+.mono, td.date { font-family: var(--mono); font-size: 12.5px; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
 .ep { display: grid; line-height: 1.3; }
-.ep small { font-family: var(--mono); font-size: 10.5px; color: var(--muted); letter-spacing: 0.03em; }
+.ep small { font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
 .arrow { color: var(--muted); padding-inline: 0; }
-
+.meter { display: flex; align-items: center; gap: 8px; min-width: 150px; }
+.meter .track { flex: 1; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+.meter .fill { height: 100%; border-radius: 3px; background: var(--accent); min-width: 2px; }
+.meter span { font-variant-numeric: tabular-nums; min-width: 3.6em; text-align: right; }
 .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 600;
   padding: 2px 8px; border-radius: 999px; letter-spacing: 0.02em; }
 .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
-.pill.ok { color: var(--ok); background: var(--ok-soft); }
+.pill.ok { color: var(--good); background: var(--good-soft); }
 .pill.off { color: var(--off); background: var(--off-soft); }
 .pill.warn { color: var(--warn); background: var(--warn-soft); }
-.tag { display: inline-block; font-family: var(--mono); font-size: 11px; font-weight: 500; padding: 1px 7px;
-  border-radius: 4px; text-transform: uppercase; }
-.tag.aws { color: var(--aws); background: var(--aws-soft); }
-.tag.gcp { color: var(--gcp); background: var(--gcp-soft); }
-.tag.internet { color: var(--inet); background: var(--inet-soft); }
-.tag.azure, .tag.oracle, .tag.other { color: var(--other); background: var(--other-soft); }
+.pill.info { color: var(--accent); background: var(--accent-soft); }
+.cloud { display: inline-flex; align-items: center; gap: 6px; }
 .prio { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.saving { color: var(--good); font-weight: 600; }
+.controls { display: flex; flex-wrap: wrap; gap: 6px; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; background: var(--surface); }
+.seg button { font: inherit; font-size: 12.5px; border: 0; background: transparent; color: var(--muted); padding: 5px 11px; cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+button:focus-visible, input:focus-visible, th:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+input[type=search] { font: inherit; font-size: 13px; padding: 5px 10px; border: 1px solid var(--line);
+  border-radius: 7px; background: var(--surface); color: var(--fg); width: 210px; max-width: 100%; }
+.count { font-family: var(--mono); font-size: 12px; color: var(--muted); }
 .empty { padding: 18px; color: var(--muted); }
-footer { color: var(--muted); font-size: 12px; }
-@media (max-width: 560px) { h1 { font-size: 24px; } input[type=search] { width: 100%; } }
+ul.method { margin: 0; padding-left: 18px; color: var(--fg2); font-size: 13px; display: grid; gap: 4px; max-width: 90ch; }
+footer { color: var(--muted); font-size: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
+@media (max-width: 560px) { h1 { font-size: 27px; } .kpi .num { font-size: 27px; } input[type=search] { width: 100%; } }
+@media (prefers-reduced-motion: no-preference) { .hbar .bar, .meter .fill { transition: width .3s ease; } }
 </style>
 
 <div class="wrap">
   <header>
-    <div>
-      <div class="eyebrow">Equinix Fabric &amp; Network Edge</div>
-      <h1>Fabric Inventory</h1>
+    <div class="title-row">
+      <div>
+        <div class="eyebrow">Equinix Fabric &amp; Network Edge</div>
+        <h1>Interconnect Report</h1>
+      </div>
+      <div class="meta" id="meta"></div>
     </div>
-    <div class="meta" id="meta"></div>
+    <nav aria-label="Sections">
+      <a href="#summary">Summary</a><a href="#spend">Spend</a><a href="#utilization">Utilization</a>
+      <a href="#rightsizing">Right-sizing</a><a href="#inventory">Inventory</a>
+    </nav>
   </header>
 
-  <div class="summary" id="summary"></div>
+  <section id="summary">
+    <div class="kpis" id="kpis"></div>
+    <div class="findings" id="findings"></div>
+  </section>
 
-  <section>
-    <div class="sec-head">
-      <div class="sec-title"><h2>Network Edge devices</h2><span class="count" id="dev-count"></span></div>
+  <section id="spend">
+    <div class="sec-head"><h2>Spend</h2><span class="count" id="spend-sub"></span></div>
+    <div class="grid2">
+      <div class="card">
+        <div class="card-head"><h3>Monthly charges by category</h3><span class="sub">Invoice month, before tax</span></div>
+        <div class="chart" id="spend-chart"></div>
+        <div class="legend" id="spend-legend"></div>
+        <p class="note" id="spend-note"></p>
+        <details class="tv"><summary>Show as table</summary><div class="frame flat"><table id="spend-table"></table></div></details>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Latest invoice by item</h3><span class="sub" id="items-sub"></span></div>
+        <div class="hbars chart" id="items"></div>
+      </div>
     </div>
+  </section>
+
+  <section id="utilization">
+    <div class="sec-head"><h2>Utilization</h2><span class="count" id="util-sub"></span></div>
+    <p class="lede">Hourly peak throughput per link (the busier direction). All panels share one scale so links compare directly; provisioned capacity is far above it.</p>
+    <div class="frame"><table id="util-table"></table></div>
+    <div class="multiples" id="multiples"></div>
+  </section>
+
+  <section id="rightsizing">
+    <div class="sec-head"><h2>Right-sizing</h2><span class="count" id="size-sub"></span></div>
+    <div class="frame"><table id="size-table"></table></div>
+    <ul class="method" id="method"></ul>
+  </section>
+
+  <section id="inventory">
+    <div class="sec-head"><h2>Inventory</h2></div>
+    <div class="card-head"><h3>Network Edge devices</h3><span class="count" id="dev-count"></span></div>
     <div class="frame"><table id="devices"></table></div>
-  </section>
-
-  <section>
-    <div class="sec-head">
-      <div class="sec-title"><h2>Cloud Routers</h2><span class="count" id="rtr-count"></span></div>
-      <div class="controls"><div class="seg" data-target="routers" data-key="lifecycle"></div></div>
-    </div>
+    <div class="card-head" style="margin-top:8px"><h3>Cloud Routers</h3>
+      <div class="controls"><div class="seg" data-target="routers" data-key="lifecycle"></div></div></div>
     <div class="frame"><table id="routers"></table></div>
-  </section>
-
-  <section>
-    <div class="sec-head">
-      <div class="sec-title"><h2>Connections</h2><span class="count" id="conn-count"></span></div>
+    <div class="card-head" style="margin-top:8px"><h3>Connections <span class="count" id="conn-count"></span></h3>
       <div class="controls">
         <input type="search" id="conn-search" placeholder="Filter by name or endpoint" aria-label="Filter connections">
         <div class="seg" data-target="connections" data-key="cloud"></div>
         <div class="seg" data-target="connections" data-key="lifecycle"></div>
-      </div>
-    </div>
+      </div></div>
     <div class="frame"><table id="connections"></table></div>
   </section>
 
@@ -234,41 +524,274 @@ footer { color: var(--muted); font-size: 12px; }
 </div>
 
 <script>
-const DATA = __DATA__;
+const D = __DATA__;
+const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-const bw = m => !m ? "—" : m >= 1000 ? (m / 1000).toLocaleString() + " Gbps" : m + " Mbps";
+const money = v => (v < 0 ? "−$" : "$") + Math.abs(Math.round(v)).toLocaleString("en-US");
+const bw = m => m == null ? "—" : m >= 1000 ? (m / 1000).toLocaleString() + " Gbps" : (+m).toLocaleString() + " Mbps";
+const mbps = v => v >= 1000 ? (v / 1000).toFixed(2) + " Gbps" : v >= 10 ? Math.round(v) + " Mbps" : (+v).toFixed(1) + " Mbps";
+const monthName = m => new Date(m + "-01T00:00:00Z").toLocaleString("en-US", {month: "short", timeZone: "UTC"});
+const monthYear = m => new Date(m + "-01T00:00:00Z").toLocaleString("en-US", {month: "short", year: "numeric", timeZone: "UTC"});
+const CAT_VAR = {"Google Cloud": "--c-gcp", "AWS": "--c-aws", "Network Edge": "--c-ne", "Cloud Router": "--c-cr", "Internet Access": "--c-inet", "Other": "--c-other"};
+const CLOUD_VAR = {gcp: "--c-gcp", aws: "--c-aws", internet: "--c-inet"};
+const CLOUD_NAME = {gcp: "Google Cloud", aws: "AWS", internet: "Internet", azure: "Azure", oracle: "Oracle", other: "Other"};
+const cssVar = v => `var(${v})`;
+const cloudChip = c => `<span class="cloud"><span class="dot" style="background:${cssVar(CLOUD_VAR[c] || "--c-other")}"></span>${esc(CLOUD_NAME[c] || c)}</span>`;
+const SVGNS = "http://www.w3.org/2000/svg";
+function svgEl(tag, attrs = {}, parent) {
+  const el = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  if (parent) parent.appendChild(el);
+  return el;
+}
+function niceMax(v, ticks = 4) {
+  if (v <= 0) return 1;
+  const raw = v / ticks, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw);
+  return { max: step * Math.ceil(v / step), step };
+}
+// Shared tooltip built with textContent only.
+function tooltip(host) {
+  const tip = document.createElement("div");
+  tip.className = "tip"; tip.hidden = true; host.appendChild(tip);
+  return {
+    show(x, y, head, rows) {
+      tip.replaceChildren();
+      const h = document.createElement("div"); h.className = "t-head"; h.textContent = head; tip.appendChild(h);
+      for (const [color, label, value] of rows) {
+        const r = document.createElement("div"); r.className = "t-row";
+        if (color) { const d = document.createElement("span"); d.className = "sw"; d.style.background = color; r.appendChild(d); }
+        r.appendChild(document.createTextNode(label));
+        const b = document.createElement("b"); b.textContent = value; r.appendChild(b);
+        tip.appendChild(r);
+      }
+      tip.hidden = false;
+      const w = host.clientWidth, tw = tip.offsetWidth;
+      tip.style.left = Math.max(0, Math.min(w - tw, x + 12)) + "px";
+      tip.style.top = Math.max(0, y - tip.offsetHeight - 10) + "px";
+    },
+    hide() { tip.hidden = true; },
+  };
+}
+function onResize(el, fn) {
+  let w = 0;
+  new ResizeObserver(() => { if (el.clientWidth !== w) { w = el.clientWidth; fn(); } }).observe(el);
+}
+
+/* ---------- header, KPIs, findings ---------- */
+const B = D.billing, U = D.util, S = D.sizing, F = D.footprint;
+const winStart = U ? new Date(U.start) : null;
+const winEnd = U ? new Date(winStart.getTime() + (U.hours - 1) * 3600e3) : null;
+const fmtDay = d => d.toLocaleDateString("en-US", {month: "short", day: "numeric", year: "numeric", timeZone: "UTC"});
+$("meta").innerHTML = [
+  D.account && `<span>Account <b>${esc(D.account)}</b></span>`,
+  U && `<span>Traffic <b>${fmtDay(winStart)} – ${fmtDay(winEnd)}</b></span>`,
+  B && B.latest && `<span>Latest invoice <b>${esc(fmtDay(new Date(B.latest + "T00:00:00Z")))}</b></span>`,
+  `<span>Generated <b>${esc(D.generated)}</b></span>`,
+].filter(Boolean).join("");
+
+const kpis = [];
+if (B) {
+  const m = B.monthly, first = m[0], last = m[m.length - 1];
+  const ch = first && first.total_charges ? (last.total_charges - first.total_charges) / first.total_charges * 100 : 0;
+  kpis.push(["Monthly run-rate", money(B.runRate), "",
+    Math.abs(ch) >= 1 ? `<span class="delta ${ch < 0 ? "good" : "warn"}">${ch < 0 ? "▼" : "▲"} ${Math.abs(ch).toFixed(0)}% vs ${monthYear(first.month)}</span>` : "Recurring charges, before tax"]);
+  kpis.push(["Last 12 months", money(B.last12), "", B.credits ? `Includes ${money(-B.credits)} in credits` : "Invoiced, including tax"]);
+}
+if (S) kpis.push(["Potential savings", money(S.monthly_savings), "/mo", `${money(S.monthly_savings * 12)} per year`]);
+if (U) kpis.push(["Peak traffic per cloud", mbps(F.peakCloud).split(" ")[0], mbps(F.peakCloud).split(" ")[1],
+  `Busiest cloud, all its links combined · ${bw(F.cloudCapacity)} provisioned on ${F.cloudLinks} links`]);
+kpis.push(["Footprint", F.active, " links", `${F.routers} Cloud Router · ${F.neNodes}-node firewall`]);
+$("kpis").innerHTML = kpis.map(([label, num, unit, sub]) =>
+  `<div class="kpi"><span class="eyebrow">${label}</span><span class="num">${esc(num)}${unit ? `<small>${esc(unit)}</small>` : ""}</span><span class="sub">${sub}</span></div>`).join("");
+
+const ICON = {good: "✓", warn: "!", info: "i"};
+$("findings").innerHTML = D.findings.map(f =>
+  `<div class="finding ${f.tone}"><span class="icon" aria-hidden="true">${ICON[f.tone]}</span><h3>${esc(f.title)}</h3><p>${esc(f.body)}</p></div>`).join("");
+
+/* ---------- spend: stacked columns ---------- */
+function drawSpend() {
+  const host = $("spend-chart");
+  host.replaceChildren();
+  if (!B) { host.innerHTML = `<p class="empty">Billing data wasn't available for this run.</p>`; return; }
+  const cats = D.categories.filter(c => B.monthly.some(m => m.charges[c] > 0));
+  const W = host.clientWidth, H = 260, m = {t: 22, r: 8, b: 26, l: 48};
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const {max, step} = niceMax(Math.max(...B.monthly.map(x => x.total_charges)));
+  const y = v => m.t + ih - v / max * ih;
+  const band = iw / B.monthly.length, bwid = Math.min(24, band * 0.6);
+  const svg = svgEl("svg", {viewBox: `0 0 ${W} ${H}`, height: H, role: "img", "aria-label": "Monthly charges by category"}, host);
+  const g = svgEl("g", {class: "grid"}, svg), ax = svgEl("g", {class: "axis"}, svg);
+  for (let v = 0; v <= max + 1e-9; v += step) {
+    if (v > 0) svgEl("line", {x1: m.l, x2: W - m.r, y1: y(v), y2: y(v)}, g);
+    svgEl("text", {x: m.l - 8, y: y(v) + 4, "text-anchor": "end"}, ax).textContent = v >= 1000 ? "$" + (v / 1000) + "k" : "$" + v;
+  }
+  svgEl("line", {class: "baseline", x1: m.l, x2: W - m.r, y1: y(0), y2: y(0)}, svg);
+  const tip = tooltip(host);
+  const every = band < 34 ? 2 : 1;
+  B.monthly.forEach((mo, i) => {
+    const cx = m.l + band * i + band / 2, x0 = cx - bwid / 2;
+    let acc = 0;
+    const segs = cats.filter(c => mo.charges[c] > 0);
+    segs.forEach((c, j) => {
+      const v = mo.charges[c], top = y(acc + v), bot = y(acc);
+      const isTop = j === segs.length - 1, gap = j > 0 ? 2 : 0;
+      const h = Math.max(0, bot - top - gap), r = isTop ? Math.min(4, h) : 0;
+      const yb = bot - gap, yt = yb - h;
+      svgEl("path", {fill: cssVar(CAT_VAR[c]), d: `M${x0},${yb}V${yt + r}Q${x0},${yt} ${x0 + r},${yt}H${x0 + bwid - r}Q${x0 + bwid},${yt} ${x0 + bwid},${yt + r}V${yb}Z`}, svg);
+      acc += v;
+    });
+    if (i % every === (B.monthly.length - 1) % every)
+      svgEl("text", {x: cx, y: H - 8, "text-anchor": "middle"}, ax).textContent = monthName(mo.month);
+    if (i === B.monthly.length - 1)
+      svgEl("text", {class: "cap-label", x: cx, y: y(acc) - 7, "text-anchor": "middle"}, svg).textContent = money(acc);
+    const hit = svgEl("rect", {x: m.l + band * i, y: m.t, width: band, height: ih, fill: "transparent", tabindex: 0,
+      "aria-label": `${monthYear(mo.month)}: ${money(mo.total_charges)}`}, svg);
+    const show = ev => {
+      const rows = [...segs].reverse().map(c => [cssVar(CAT_VAR[c]), c, money(mo.charges[c])]);
+      rows.push([null, "Total charges", money(mo.total_charges)]);
+      if (mo.credits) rows.push([null, "Credits", money(mo.credits)]);
+      const r = host.getBoundingClientRect();
+      tip.show(ev.clientX ? ev.clientX - r.left : cx, ev.clientY ? ev.clientY - r.top : y(acc), monthYear(mo.month), rows);
+    };
+    hit.addEventListener("pointermove", show); hit.addEventListener("focus", show);
+    hit.addEventListener("pointerleave", tip.hide); hit.addEventListener("blur", tip.hide);
+  });
+  $("spend-legend").innerHTML = cats.map(c => `<span><span class="sw" style="background:${cssVar(CAT_VAR[c])}"></span>${esc(c)}</span>`).join("");
+}
+if (B) {
+  const credits = B.monthly.filter(m => m.credits);
+  $("spend-note").textContent = credits.length
+    ? "Credits are not drawn: " + credits.map(m => `${money(m.credits)} on the ${monthYear(m.month)} invoice`).join(", ") + "."
+    : "";
+  $("spend-sub").textContent = `${B.monthly.length} invoices · ${B.currency}`;
+  const cats = D.categories.filter(c => B.monthly.some(m => m.charges[c] > 0));
+  $("spend-table").innerHTML = `<thead><tr><th>Month</th>${cats.map(c => `<th class="num">${esc(c)}</th>`).join("")}<th class="num">Charges</th><th class="num">Credits</th></tr></thead><tbody>` +
+    B.monthly.map(m => `<tr><td>${monthYear(m.month)}</td>${cats.map(c => `<td class="num">${money(m.charges[c])}</td>`).join("")}<td class="num"><b>${money(m.total_charges)}</b></td><td class="num">${m.credits ? money(m.credits) : "—"}</td></tr>`).join("") + "</tbody>";
+
+  // Latest invoice by item: horizontal bars, value at the tip.
+  const items = B.items, maxItem = Math.max(...items.map(i => i.amount)), total = items.reduce((t, i) => t + i.amount, 0);
+  $("items-sub").textContent = `${money(total)} · ${monthYear(B.latest.slice(0, 7))}`;
+  const host = $("items"), tip = tooltip(host);
+  items.forEach(it => {
+    const row = document.createElement("div");
+    row.className = "hbar"; row.tabIndex = 0;
+    row.innerHTML = `<span class="lab"><span class="sw" style="background:${cssVar(CAT_VAR[it.category])}"></span><span></span></span><span class="track"><span class="bar" style="display:block;width:${it.amount / maxItem * 100}%;background:${cssVar(CAT_VAR[it.category])}"></span></span><span class="val">${money(it.amount)}</span>`;
+    row.querySelector(".lab span:last-child").textContent = it.item;
+    const show = () => tip.show(row.offsetLeft + row.offsetWidth * 0.4, row.offsetTop, it.item,
+      [[cssVar(CAT_VAR[it.category]), it.category, money(it.amount)], [null, "Share of invoice", (it.amount / total * 100).toFixed(1) + "%"]]);
+    row.addEventListener("pointerenter", show); row.addEventListener("focus", show);
+    row.addEventListener("pointerleave", tip.hide); row.addEventListener("blur", tip.hide);
+    host.appendChild(row);
+  });
+} else {
+  $("items").innerHTML = `<p class="empty">Billing data wasn't available for this run.</p>`;
+}
+onResize($("spend-chart"), drawSpend);
+
+/* ---------- utilization ---------- */
+if (U) {
+  $("util-sub").textContent = `${U.links.length} links · last ${D.days} days · 5-minute samples`;
+  const hdr = ["Link", "Cloud", "Role", "Capacity", "Average", "95th pct", "Peak", "Peak vs capacity", "Monthly cost"];
+  $("util-table").innerHTML = `<thead><tr>${hdr.map((h, i) => `<th class="${i >= 3 && i !== 7 ? "num" : ""}">${h}</th>`).join("")}</tr></thead><tbody>` +
+    U.links.map(l => `<tr><td class="name">${esc(l.name)}</td><td>${cloudChip(l.cloud)}</td><td><span class="prio">${esc(l.priority || "—")}</span></td>
+      <td class="num">${bw(l.bandwidth)}</td><td class="num">${mbps(l.mean)}</td><td class="num">${mbps(l.p95)}</td><td class="num"><b>${mbps(l.peak)}</b></td>
+      <td><div class="meter"><div class="track"><div class="fill" style="width:${Math.min(100, l.peak_pct)}%"></div></div><span>${l.peak_pct < 0.1 ? "<0.1" : l.peak_pct.toFixed(1)}%</span></div></td>
+      <td class="num">${l.cost != null ? money(l.cost) : "—"}</td></tr>`).join("") + "</tbody>";
+
+  const shared = niceMax(Math.max(...U.links.map(l => l.peak)) || 1, 2);
+  const panels = U.links.map(l => {
+    const p = document.createElement("div");
+    p.className = "panel";
+    p.innerHTML = `<div class="panel-head"><h3><span class="dot" style="background:${cssVar(CLOUD_VAR[l.cloud] || "--c-other")}"></span><span></span></h3><span class="sub">peak ${mbps(l.peak)} · ${bw(l.bandwidth)} link</span></div><div class="chart"></div>`;
+    p.querySelector("h3 span:last-child").textContent = l.name;
+    $("multiples").appendChild(p);
+    return [p.querySelector(".chart"), l];
+  });
+  const drawPanel = (host, l) => {
+    host.replaceChildren();
+    const W = host.clientWidth, H = 150, m = {t: 10, r: 6, b: 22, l: 46};
+    const iw = W - m.l - m.r, ih = H - m.t - m.b, n = U.hours;
+    const x = i => m.l + i / (n - 1) * iw, y = v => m.t + ih - Math.min(v, shared.max) / shared.max * ih;
+    const svg = svgEl("svg", {viewBox: `0 0 ${W} ${H}`, height: H, role: "img", "aria-label": `${l.name} hourly peak throughput`}, host);
+    const g = svgEl("g", {class: "grid"}, svg), ax = svgEl("g", {class: "axis"}, svg);
+    for (let v = 0; v <= shared.max + 1e-9; v += shared.step) {
+      if (v > 0) svgEl("line", {x1: m.l, x2: W - m.r, y1: y(v), y2: y(v)}, g);
+      svgEl("text", {x: m.l - 6, y: y(v) + 4, "text-anchor": "end"}, ax).textContent = v >= 1000 ? (v / 1000) + "G" : v + "M";
+    }
+    // month ticks
+    const t0 = new Date(U.start).getTime();
+    for (let d = new Date(U.start); d.getTime() <= t0 + (n - 1) * 3600e3; d.setUTCDate(d.getUTCDate() + 1)) {
+      if (d.getUTCDate() !== 1 || d.getUTCHours() !== 0) continue;
+      const i = (d.getTime() - t0) / 3600e3;
+      svgEl("text", {x: x(i), y: H - 6, "text-anchor": "middle"}, ax).textContent = d.toLocaleString("en-US", {month: "short", timeZone: "UTC"});
+    }
+    svgEl("line", {class: "baseline", x1: m.l, x2: W - m.r, y1: y(0), y2: y(0)}, svg);
+    const val = i => Math.max(l.in[i] ?? 0, l.out[i] ?? 0);
+    let line = "", started = false;
+    for (let i = 0; i < n; i++) {
+      if (l.in[i] == null && l.out[i] == null) { started = false; continue; }
+      line += (started ? "L" : "M") + x(i).toFixed(1) + "," + y(val(i)).toFixed(1); started = true;
+    }
+    const color = cssVar(CLOUD_VAR[l.cloud] || "--c-other");
+    svgEl("path", {d: line + `L${x(n - 1)},${y(0)}L${x(0)},${y(0)}Z`, fill: color, "fill-opacity": 0.1, stroke: "none"}, svg);
+    svgEl("path", {d: line, fill: "none", stroke: color, "stroke-width": 1.5, "stroke-linejoin": "round", "stroke-linecap": "round"}, svg);
+    let pk = 0; for (let i = 1; i < n; i++) if (val(i) > val(pk)) pk = i;
+    svgEl("circle", {cx: x(pk), cy: y(val(pk)), r: 4, fill: color, stroke: "var(--surface)", "stroke-width": 2}, svg);
+    const cross = svgEl("line", {x1: 0, x2: 0, y1: m.t, y2: m.t + ih, stroke: "var(--axis)", "stroke-width": 1, visibility: "hidden"}, svg);
+    const dot = svgEl("circle", {r: 4, fill: color, stroke: "var(--surface)", "stroke-width": 2, visibility: "hidden"}, svg);
+    const tip = tooltip(host);
+    const hit = svgEl("rect", {x: m.l, y: 0, width: iw, height: H, fill: "transparent"}, svg);
+    hit.addEventListener("pointermove", ev => {
+      const r = svg.getBoundingClientRect(), px = (ev.clientX - r.left) * W / r.width;
+      const i = Math.max(0, Math.min(n - 1, Math.round((px - m.l) / iw * (n - 1))));
+      cross.setAttribute("x1", x(i)); cross.setAttribute("x2", x(i)); cross.setAttribute("visibility", "visible");
+      dot.setAttribute("cx", x(i)); dot.setAttribute("cy", y(val(i))); dot.setAttribute("visibility", "visible");
+      const when = new Date(t0 + i * 3600e3).toLocaleString("en-US", {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "UTC", hour12: false}) + " UTC";
+      tip.show(x(i) * r.width / W, 20, when, [[null, "Inbound", l.in[i] == null ? "—" : mbps(l.in[i])], [null, "Outbound", l.out[i] == null ? "—" : mbps(l.out[i])],
+        [null, "of capacity", (val(i) / l.bandwidth * 100).toFixed(2) + "%"]]);
+    });
+    hit.addEventListener("pointerleave", () => { tip.hide(); cross.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden"); });
+  };
+  panels.forEach(([host, l]) => onResize(host, () => drawPanel(host, l)));
+} else {
+  $("util-table").innerHTML = `<tbody><tr><td class="empty">Utilization data wasn't available for this run.</td></tr></tbody>`;
+}
+
+/* ---------- right-sizing ---------- */
+if (S && S.links.length) {
+  const ACT = {decommission: ["warn", "Decommission"], downsize: ["info", "Downsize"], keep: ["ok", "Keep"]};
+  $("size-sub").textContent = `${money(S.monthly_savings)}/mo · ${money(S.monthly_savings * 12)}/yr`;
+  const hdr = ["Link", "Cloud", "Action", "Current", "Pair peak", "Needed", "Recommended", "Cost now", "Cost after", "Savings / mo"];
+  $("size-table").innerHTML = `<thead><tr>${hdr.map((h, i) => `<th class="${i >= 3 ? "num" : ""}">${h}</th>`).join("")}</tr></thead><tbody>` +
+    S.links.map(r => `<tr><td class="name">${esc(r.name)}</td><td>${cloudChip(r.cloud)}</td><td><span class="pill ${ACT[r.action][0]}">${ACT[r.action][1]}</span></td>
+      <td class="num">${bw(r.bandwidth)}</td><td class="num">${mbps(r.combined_peak)}</td><td class="num">${mbps(r.needed)}</td>
+      <td class="num"><b>${r.recommended ? bw(r.recommended) : "—"}</b></td><td class="num">${money(r.current_cost)}</td><td class="num">${money(r.new_cost)}</td>
+      <td class="num ${r.savings > 0 ? "saving" : ""}">${money(r.savings)}</td></tr>`).join("") +
+    `</tbody><tfoot><tr><td colspan="7">Total</td><td class="num">${money(S.links.reduce((t, r) => t + r.current_cost, 0))}</td><td class="num">${money(S.links.reduce((t, r) => t + r.new_cost, 0))}</td><td class="num saving">${money(S.monthly_savings)}</td></tr></tfoot>`;
+  const tiers = Object.entries(S.tiers).map(([b, p]) => `${bw(+b)} ${money(p)}`).join(" · ");
+  $("method").innerHTML = [
+    `Links are sized in redundant pairs (same cloud and bandwidth). Each link must be able to carry the pair's combined peak on its own if its partner fails, plus ${Math.round((S.headroom - 1) * 100)}% headroom ("Needed").`,
+    `A pair whose combined peak stayed under ${S.idle_mbps} Mbps over the last ${D.days} days is marked for decommissioning. Confirm it isn't a deliberate standby path first.`,
+    `Cost after uses Equinix list prices for this metro: ${esc(tiers)} per month.`,
+    `Peaks are 5-minute averages, so very short bursts can exceed them. Review month-end and quarterly jobs before downsizing.`,
+    `Changing an Equinix tier usually means matching the cloud side as well: the AWS hosted connection capacity, or the Google VLAN attachment capacity.`,
+  ].map(t => `<li>${t}</li>`).join("");
+} else {
+  $("size-table").innerHTML = `<tbody><tr><td class="empty">No right-sizing data for this run.</td></tr></tbody>`;
+}
+
+/* ---------- inventory tables ---------- */
 const GOOD = new Set(["PROVISIONED", "ACTIVE", "AVAILABLE"]);
 const GONE = new Set(["DEPROVISIONED", "DELETED", "NOT_PROVISIONED"]);
 const pill = s => `<span class="pill ${GOOD.has(s) ? "ok" : GONE.has(s) ? "off" : "warn"}">${esc(s || "UNKNOWN")}</span>`;
-const ep = e => `<span class="ep">${esc(e.name)}<small>${esc(e.kind.replace("_", " "))}</small></span>`;
 const KIND = {VD: "Edge device", CLOUD_ROUTER: "Cloud router", SP: "Service profile", COLO: "Port", NETWORK: "Network"};
-const conns = DATA.connections.map(c => ({...c, a: {...c.a, kind: KIND[c.a.kind] || c.a.kind}, z: {...c.z, kind: KIND[c.z.kind] || c.z.kind}}));
-
-const active = conns.filter(c => c.lifecycle === "active");
-const sumBw = cloud => active.filter(c => c.cloud === cloud).reduce((t, c) => t + c.mbps, 0);
+const ep = e => `<span class="ep">${esc(e.name)}<small>${esc(KIND[e.kind] || e.kind)}</small></span>`;
 const count = (rows, k, v) => rows.filter(r => r[k] === v).length;
-
-document.getElementById("meta").innerHTML =
-  (DATA.account ? `<span>Account <b>${esc(DATA.account)}</b></span>` : "") +
-  `<span>Generated <b>${esc(DATA.generated)}</b></span>`;
-document.getElementById("summary").innerHTML = [
-  ["Active connections", active.length, `${count(conns, "lifecycle", "deprovisioned")} deprovisioned`],
-  ["AWS Direct Connect", bw(sumBw("aws")), `${count(active, "cloud", "aws")} active links`],
-  ["Google Interconnect", bw(sumBw("gcp")), `${count(active, "cloud", "gcp")} active links`],
-  ["Internet Access", bw(sumBw("internet")), `${count(active, "cloud", "internet")} active links`],
-  ["Cloud Routers", count(DATA.routers, "lifecycle", "active"), `${count(DATA.routers, "lifecycle", "deprovisioned")} deprovisioned`],
-  ["Network Edge", DATA.devices.length, `${DATA.ports} dedicated ports`],
-].map(([label, num, sub]) => {
-  const [n, unit] = String(num).split(" ");
-  return `<div class="stat"><span class="eyebrow">${label}</span><span class="num">${esc(n)}${unit ? `<small>${unit}</small>` : ""}</span><span class="sub">${sub}</span></div>`;
-}).join("");
-document.getElementById("foot").textContent =
-  `Generated by collect_fabric_inventory.py from the Equinix Fabric v4 and Network Edge v1 APIs.`;
-
-// Table definitions: [header, key for sorting, cell renderer, css class]
 const TABLES = {
-  devices: { rows: DATA.devices, cols: [
+  devices: { rows: D.devices, cols: [
     ["Name", "name", r => esc(r.name), "name"],
+    ["Nodes", "nodes", r => esc(r.nodes)],
     ["Status", "status", r => pill(r.status)],
     ["Type", "type", r => esc(r.type)],
     ["Vendor", "vendor", r => esc(r.vendor)],
@@ -276,7 +799,7 @@ const TABLES = {
     ["IBX", "ibx", r => esc(r.ibx), "mono"],
     ["Created", "created", r => esc(r.created), "date"],
   ]},
-  routers: { rows: DATA.routers, cols: [
+  routers: { rows: D.routers, cols: [
     ["Name", "name", r => esc(r.name), "name"],
     ["State", "state", r => pill(r.state)],
     ["Package", "package", r => esc(r.package), "mono"],
@@ -286,17 +809,16 @@ const TABLES = {
     ["Created", "created", r => esc(r.created), "date"],
     ["Updated / deleted", r => r.deleted || r.updated, r => esc(r.deleted || r.updated), "date"],
   ]},
-  connections: { rows: conns, cols: [
+  connections: { rows: D.connections, cols: [
     ["Name", "name", r => esc(r.name), "name"],
     ["Status", "status", r => pill(r.status)],
-    ["Cloud", "cloud", r => `<span class="tag ${esc(r.cloud)}">${esc(r.cloud)}</span>`],
+    ["Cloud", "cloud", r => cloudChip(r.cloud)],
     ["Bandwidth", "mbps", r => bw(r.mbps), "num"],
     ["Role", "priority", r => `<span class="prio">${esc(r.priority || "—")}</span>`],
     ["A-side", r => r.a.name, r => ep(r.a)],
     ["", null, () => "→", "arrow"],
     ["Z-side", r => r.z.name, r => ep(r.z)],
     ["Type", "type", r => esc(r.type), "mono"],
-    ["Metro", "metro", r => esc(r.metro), "mono"],
     ["Created", "created", r => esc(r.created), "date"],
     ["Updated / deleted", r => r.deleted || r.updated, r => esc(r.deleted || r.updated), "date"],
   ]},
@@ -307,7 +829,6 @@ const state = {
   connections: { sort: null, dir: 1, filters: { lifecycle: "active", cloud: "all" }, q: "" },
 };
 const valueOf = (key, r) => typeof key === "function" ? key(r) : r[key];
-
 function render(id) {
   const def = TABLES[id], st = state[id];
   let rows = def.rows.filter(r => Object.entries(st.filters).every(([k, v]) => v === "all" || r[k] === v));
@@ -323,28 +844,26 @@ function render(id) {
     });
   }
   const head = "<thead><tr>" + def.cols.map(([h, key, , cls], i) =>
-    `<th class="${cls || ""}" ${key === null ? "" : `data-i="${i}" tabindex="0"`} ${st.sort === i ? `aria-sort="${st.dir > 0 ? "ascending" : "descending"}"` : ""}>${h}</th>`).join("") + "</tr></thead>";
+    `<th class="${cls || ""} ${key === null ? "" : "sortable"}" ${key === null ? "" : `data-i="${i}" tabindex="0"`} ${st.sort === i ? `aria-sort="${st.dir > 0 ? "ascending" : "descending"}"` : ""}>${h}</th>`).join("") + "</tr></thead>";
   const body = rows.length
     ? rows.map(r => `<tr class="${r.lifecycle === "deprovisioned" ? "gone" : ""}">` +
         def.cols.map(([, , cell, cls]) => `<td class="${cls || ""}">${cell(r)}</td>`).join("") + "</tr>").join("")
     : `<tr><td class="empty" colspan="${def.cols.length}">No ${id} match these filters.</td></tr>`;
-  const table = document.getElementById(id);
+  const table = $(id);
   table.innerHTML = head + "<tbody>" + body + "</tbody>";
   table.querySelectorAll("th[data-i]").forEach(th => {
     const go = () => { const i = +th.dataset.i; st.dir = st.sort === i ? -st.dir : 1; st.sort = i; render(id); };
     th.onclick = go;
     th.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
   });
-  const total = def.rows.length;
-  const el = document.getElementById({devices: "dev-count", routers: "rtr-count", connections: "conn-count"}[id]);
-  el.textContent = rows.length === total ? `${total}` : `${rows.length} of ${total}`;
+  const el = {devices: "dev-count", connections: "conn-count"}[id];
+  if (el) $(el).textContent = rows.length === def.rows.length ? `${def.rows.length}` : `${rows.length} of ${def.rows.length}`;
 }
-
 function segment(el) {
   const id = el.dataset.target, key = el.dataset.key, rows = TABLES[id].rows;
   const opts = key === "lifecycle"
     ? [["active", "Active"], ["deprovisioned", "Deprovisioned"], ["all", "All"]]
-    : [["all", "All clouds"], ...[...new Set(rows.map(r => r[key]))].sort().map(v => [v, v.toUpperCase()])];
+    : [["all", "All clouds"], ...[...new Set(rows.map(r => r[key]))].sort().map(v => [v, CLOUD_NAME[v] || v])];
   el.innerHTML = opts.map(([v, label]) => {
     const n = v === "all" ? rows.length : count(rows, key, v);
     return `<button type="button" data-v="${esc(v)}" aria-pressed="${state[id].filters[key] === v}">${esc(label)} <span class="count">${n}</span></button>`;
@@ -355,9 +874,9 @@ function segment(el) {
     render(id);
   });
 }
-
 document.querySelectorAll(".seg").forEach(segment);
-document.getElementById("conn-search").oninput = e => { state.connections.q = e.target.value.trim(); render("connections"); };
+$("conn-search").oninput = e => { state.connections.q = e.target.value.trim(); render("connections"); };
 Object.keys(TABLES).forEach(render);
+$("foot").textContent = "Source: Equinix Fabric v4 (connections, Cloud Routers, statistics, prices), Network Edge v1 and Billing v2 APIs, via collect_fabric_inventory.py. Amounts in " + (B ? B.currency : "USD") + ", before tax unless noted.";
 </script>
 """

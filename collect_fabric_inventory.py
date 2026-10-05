@@ -9,8 +9,12 @@ Progress/status messages go to stderr; the JSON inventory goes to stdout, e.g.
     python collect_fabric_inventory.py > inventory.json
 Add --html to also write a shareable HTML report:
     python collect_fabric_inventory.py --html inventory.html > inventory.json
+
+Besides inventory it collects bandwidth utilization (--days, default 90),
+invoices from the Billing API, and list prices used for right-sizing.
 """
 import argparse
+import datetime
 import json
 import os
 import sys
@@ -21,6 +25,8 @@ import urllib.request
 from dotenv import load_dotenv
 from equinix.services import fabricv4
 
+from insights import (INVOICE_FIELDS, rightsizing, scrub, summarize_billing,
+                      summarize_stats, trim_lines)
 from report import render_html
 
 load_dotenv()
@@ -36,6 +42,7 @@ ROUTER_STATES = ["PROVISIONED", "PROVISIONING", "NOT_PROVISIONED",
 # Anything in these states is reported as deprovisioned; everything else is
 # considered active (including in-flight states like PROVISIONING).
 INACTIVE_STATES = {"DEPROVISIONED", "DELETED", "NOT_PROVISIONED"}
+PRICE_TIERS = [50, 100, 200, 500, 1000, 2000, 5000, 10000]
 
 
 def log(msg):
@@ -73,14 +80,14 @@ def read_json(resp):
     return resp.status, json.loads(resp.data)
 
 
-def collect(name, fetch):
+def collect(name, fetch, default=list):
     """Run one collection step, logging success/failure without aborting."""
     log(f"[{name}] Querying ...")
     try:
         items = fetch()
     except Exception as e:  # noqa: BLE001 - report and keep going
         log(f"[{name}] FAILED: {e}")
-        return []
+        return default()
     log(f"[{name}] OK - {len(items)} found")
     return items
 
@@ -128,26 +135,95 @@ def get_cloud_routers(client):
     return body.get("data") or []
 
 
-def get_network_edge_devices(token):
-    # The Python SDK has no Network Edge module, so call the NE REST API directly.
+def rest(token, path, method="GET", body=None, timeout=90):
+    """Call an Equinix REST endpoint that the Python SDK doesn't cover."""
+    req = urllib.request.Request(
+        f"{API}{path}", method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.load(resp)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code}: {e.read().decode()[:300]}")
+
+
+def paged(name, token, path):
+    """Fetch every page of an offset/limit-paginated GET endpoint."""
     items, offset = [], 0
+    sep = "&" if "?" in path else "?"
     while True:
-        req = urllib.request.Request(
-            f"{API}/ne/v1/devices?offset={offset}&limit={PAGE_SIZE}",
-            headers={"Authorization": f"Bearer {token}"})
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                status, body = resp.status, json.load(resp)
-        except urllib.error.HTTPError as e:
-            raise RuntimeError(f"HTTP {e.code}: {e.read().decode()[:300]}")
+        status, body = rest(token, f"{path}{sep}offset={offset}&limit={PAGE_SIZE}")
         page = body.get("data") or []
         total = (body.get("pagination") or {}).get("total", len(page))
-        log(f"[network_edge] HTTP {status} - offset {offset}: "
-            f"{len(page)} of {total}")
+        log(f"[{name}] HTTP {status} - offset {offset}: {len(page)} of {total}")
         items += page
         offset += PAGE_SIZE
         if not page or offset >= total:
             return items
+
+
+def get_network_edge_devices(token):
+    # The Python SDK has no Network Edge module, so call the NE REST API directly.
+    # scrub() drops the cluster node admin passwords the API returns.
+    return [scrub(d) for d in paged("network_edge", token, "/ne/v1/devices")]
+
+
+def get_utilization(token, conns, days):
+    """Bandwidth utilization for each connection over the last `days` days."""
+    end = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    start = end - datetime.timedelta(days=days)
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    results = []
+    for c in conns:
+        try:
+            status, body = rest(token, (
+                f"/fabric/v4/connections/{c['uuid']}/stats"
+                f"?startDateTime={start.strftime(fmt)}"
+                f"&endDateTime={end.strftime(fmt)}&viewPoint=aSide"))
+        except RuntimeError as e:
+            # e.g. stats aren't offered for connections from virtual devices
+            log(f"[utilization] skipped {c.get('name')}: {str(e)[:160]}")
+            continue
+        u = summarize_stats(c, body)
+        log(f"[utilization] HTTP {status} - {c.get('name')}: peak "
+            f"{u['peak']:.1f} Mbps, p95 {u['p95']:.1f} Mbps "
+            f"({u['peak_pct']}% of {c.get('bandwidth')} Mbps at peak)")
+        results.append(u)
+    return results
+
+
+def get_billing(token, account_number, names):
+    """Invoices and invoice line items (last 12 months) for the account."""
+    status, body = rest(token, f"/v2/invoices?accountNumber={account_number}")
+    invoices = [{k: i.get(k) for k in INVOICE_FIELDS}
+                for i in body.get("data") or []]
+    log(f"[billing] HTTP {status} - {len(invoices)} invoices")
+    lines = paged("billing", token,
+                  f"/v2/invoices/details?accountNumber={account_number}")
+    return invoices, trim_lines(lines, names)
+
+
+def get_prices(token, metro):
+    """List prices for Cloud Router -> cloud connections at each bandwidth."""
+    status, body = rest(token, "/fabric/v4/prices/search", "POST", {
+        "filter": {"and": [
+            {"property": "/type", "operator": "=",
+             "values": ["VIRTUAL_CONNECTION_PRODUCT"]},
+            {"property": "/connection/type", "operator": "=", "values": ["IP_VC"]},
+            {"property": "/connection/bandwidth", "operator": "IN",
+             "values": PRICE_TIERS},
+            {"property": "/connection/aSide/accessPoint/type", "operator": "=",
+             "values": ["CLOUD_ROUTER"]},
+            {"property": "/connection/zSide/accessPoint/type", "operator": "=",
+             "values": ["SP"]},
+            {"property": "/connection/aSide/accessPoint/location/metroCode",
+             "operator": "=", "values": [metro]},
+            {"property": "/connection/zSide/accessPoint/location/metroCode",
+             "operator": "=", "values": [metro]}]}})
+    log(f"[prices] HTTP {status}")
+    return body.get("data") or []
 
 
 def classify(conn):
@@ -252,10 +328,39 @@ def print_tables(routers, conns, devices):
             date(d.get("createdDate"))] for d in devices])
 
 
+def money(value):
+    return f"${value:,.0f}"
+
+
+def print_insights(util, billing, sizing):
+    table("Utilization (active connections)",
+          ["Name", "Cloud", "Capacity", "Peak Mbps", "p95 Mbps", "Peak %"],
+          [[u["name"], u["cloud"], f"{u['bandwidth']} Mbps", f"{u['peak']:.1f}",
+            f"{u['p95']:.1f}", f"{u['peak_pct']}%"] for u in util])
+    if billing:
+        table("Monthly spend (invoice month)",
+              ["Month", "Charges", "Credits"],
+              [[m["month"], money(m["total_charges"]), money(m["credits"])]
+               for m in billing["monthly"]])
+        table("Current month by item", ["Item", "Category", "Amount"],
+              [[i["item"], i["category"], money(i["amount"])]
+               for i in billing["current_items"]])
+    if sizing and sizing["links"]:
+        table(f"Right-sizing (pair peak x {sizing['headroom']} headroom)",
+              ["Link", "Current", "Pair peak", "Action", "Recommended",
+               "Savings/mo"],
+              [[r["name"], f"{r['bandwidth']} Mbps", f"{r['combined_peak']} Mbps",
+                r["action"], f"{r['recommended']} Mbps" if r["recommended"]
+                else "-", money(r["savings"])]
+               for r in sizing["links"]])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--html", metavar="PATH",
                         help="also write an HTML report to PATH")
+    parser.add_argument("--days", type=int, default=90,
+                        help="utilization window in days (default 90)")
     args = parser.parse_args()
 
     token = get_token()
@@ -271,17 +376,47 @@ def main():
 
     conns = split_lifecycle(conns, conn_status)
     routers = split_lifecycle(routers, lambda r: r.get("state"))
+
+    util = collect("utilization",
+                   lambda: get_utilization(token, conns["active"], args.days))
+    names = {x["uuid"]: x.get("name") for group in (conns, routers)
+             for state in group.values() for x in state}
+    for d in devices:
+        names[d["uuid"]] = d.get("name")
+        for node in get(d, "clusterDetails/nodes", []):
+            names[node.get("uuid")] = node.get("name")
+    account = next((get(c, "account/accountNumber") for state in conns.values()
+                    for c in state), None)
+    billing = None
+    if account:
+        invoices, lines = collect("billing", lambda: get_billing(
+            token, account, names), default=lambda: ([], []))
+        if invoices:
+            billing = summarize_billing(invoices, lines)
+            billing["invoices"] = invoices
+    metro = next((get(c, "aSide/accessPoint/location/metroCode")
+                  for c in conns["active"]), "DC")
+    prices = collect("prices", lambda: get_prices(token, metro))
+    sizing = rightsizing(util, prices, billing["current_items"] if billing else [])
+
     inventory = {"ports": ports, "connections": conns,
-                 "cloud_routers": routers, "network_edge_devices": devices}
+                 "cloud_routers": routers, "network_edge_devices": devices,
+                 "utilization": {"days": args.days, "connections": util},
+                 "billing": billing, "rightsizing": sizing}
     json.dump(inventory, sys.stdout, indent=2, default=str)
     print()
 
     print_tables(routers, conns, devices)
+    print_insights(util, billing, sizing)
     log(f"\n# {len(ports)} ports | connections: "
         f"{len(conns['active'])} active, {len(conns['deprovisioned'])} "
         f"deprovisioned | cloud routers: {len(routers['active'])} active, "
         f"{len(routers['deprovisioned'])} deprovisioned | "
         f"{len(devices)} Network Edge devices")
+    if billing:
+        log(f"# Run-rate {money(billing['run_rate'])}/mo | last 12 months "
+            f"{money(billing['last12_total'])} | potential savings "
+            f"{money(sizing['monthly_savings'])}/mo")
     if args.html:
         with open(args.html, "w", encoding="utf-8") as f:
             f.write(render_html(inventory))
