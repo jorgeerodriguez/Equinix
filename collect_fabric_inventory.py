@@ -19,8 +19,10 @@ import datetime
 import json
 import os
 import subprocess
+import pathlib
 import sys
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -58,6 +60,21 @@ DROP_METRICS = [f"equinix.fabric.connection.packets_dropped_{d}_{side}_rateexcee
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
+
+
+def load_notes(path):
+    """Report notes (comments, credit and circuit notes) from a TOML file."""
+    path = pathlib.Path(path)
+    if not path.exists():
+        log(f"[notes] {path} not found; no notes added")
+        return {}
+    with path.open("rb") as f:
+        notes = tomllib.load(f)
+    circuits = notes.get("circuits", {})
+    log(f"[notes] {path.name}: {len(notes.get('report', {}).get('comments', []))} "
+        f"comments, {len(notes.get('credits', {}))} credit notes, "
+        f"{len(circuits)} circuits ({sum(bool(c.get('keep')) for c in circuits.values())} kept)")
+    return notes
 
 
 def get_token():
@@ -483,7 +500,8 @@ def print_insights(util, billing, sizing, health, routes, drops):
               ["Link", "Current", "Pair peak", "Action", "Recommended",
                "Savings/mo"],
               [[r["name"], f"{r['bandwidth']} Mbps", f"{r['combined_peak']} Mbps",
-                r["action"], f"{r['recommended']} Mbps" if r["recommended"]
+                r["action"] + (f" ({r['kept_reason']})" if r.get("kept_reason") else ""),
+                f"{r['recommended']} Mbps" if r["recommended"]
                 else "-", money(r["savings"])]
                for r in sizing["links"]])
 
@@ -495,10 +513,17 @@ def main():
     parser.add_argument("--pdf", nargs="?", const="reports", metavar="DIR",
                         help="also write Equinix_Report_{Date}_{Time}.pdf to DIR "
                              "(default ./reports); needs Chrome, Chromium or Edge")
+    parser.add_argument("--notes", metavar="PATH",
+                        default=pathlib.Path(__file__).with_name("report_notes.toml"),
+                        help="TOML file with report comments and credit/circuit notes "
+                             "(default report_notes.toml next to this script)")
     parser.add_argument("--days", type=int, default=90,
                         help="utilization window in days (default 90)")
     args = parser.parse_args()
 
+    notes = load_notes(args.notes)
+    keep = {name: c.get("purpose") or c.get("note") or "kept by note"
+            for name, c in notes.get("circuits", {}).items() if c.get("keep")}
     token = get_token()
     client = fabricv4.ApiClient(fabricv4.Configuration(access_token=token))
     log("Collecting Fabric / Network Edge inventory ...")
@@ -538,7 +563,8 @@ def main():
     metro = next((get(c, "aSide/accessPoint/location/metroCode")
                   for c in conns["active"]), "DC")
     prices = collect("prices", lambda: get_prices(token, metro))
-    sizing = rightsizing(util, prices, billing["current_items"] if billing else [])
+    sizing = rightsizing(util, prices, billing["current_items"] if billing else [],
+                         keep)
 
     active = conns["active"]
     projects = sorted({get(c, "project/projectId") for c in active} - {""})
@@ -565,7 +591,7 @@ def main():
                  "utilization": {"days": args.days, "connections": util},
                  "billing": billing, "rightsizing": sizing,
                  "reliability": health, "routes": routes,
-                 "drops": drops, "asns": asns}
+                 "drops": drops, "asns": asns, "notes": notes}
     json.dump(inventory, sys.stdout, indent=2, default=str)
     print()
 
@@ -577,8 +603,9 @@ def main():
         f"{len(routers['deprovisioned'])} deprovisioned | "
         f"{len(devices)} Network Edge devices")
     if billing:
-        log(f"# Run-rate {money(billing['run_rate'])}/mo | last 12 months "
-            f"{money(billing['last12_total'])} | potential savings "
+        log(f"# Run-rate {money(billing['run_rate'])}/mo | 12-month charges "
+            f"{money(billing['last12_charges'])} (before tax) | credits "
+            f"{money(-billing['last12_credits'])} | potential savings "
             f"{money(sizing['monthly_savings'])}/mo")
     if args.html or args.pdf:
         html = render_html(inventory)

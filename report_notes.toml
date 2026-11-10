@@ -1,0 +1,28 @@
+# Notes merged into every Equinix Interconnect Report.
+# Edit before a run; the next report picks them up. Don't put secrets here,
+# this file is committed and its text appears in the report.
+
+[report]
+# General comments, shown in the "Notes" section near the top of the report.
+comments = [
+  "Credits are one-time refunds or adjustments, not lower monthly charges. They are listed separately and are not counted in the run-rate, 12-month charges or potential savings.",
+]
+
+# Notes on invoice credits, keyed by invoice month (YYYY-MM). The note is
+# shown next to the credit in the report; leave it empty to show none.
+[credits."2026-05"]
+note = ""   # e.g. "Refund for overbilled Network Edge nodes"
+
+# Notes on circuits, keyed by the connection name as it appears in Equinix.
+#   purpose  what the circuit is for (shown next to its name)
+#   keep     true = never recommend downsizing or decommissioning it
+#   note     longer explanation, shown in the Notes section
+[circuits.aws_primary]
+purpose = "AD traffic"
+keep = true
+note = "Used only for AD traffic, so low utilization is expected."
+
+[circuits.aws_secondary]
+purpose = "AD traffic"
+keep = true
+note = "Used only for AD traffic, so low utilization is expected."

@@ -189,8 +189,15 @@ def summarize_billing(invoices, lines):
         "currency": (latest or {}).get("currencyCode", "USD"),
         "latest_invoice": latest,
         "run_rate": (latest or {}).get("totalRecurringAmount", 0),
+        # Invoiced total (tax included, credits netted), kept for reference.
         "last12_total": round(sum(i.get("totalAmount") or 0 for i in last12), 2),
+        # Recurring + one-time charges before tax, without credits: credits
+        # are refunds/adjustments, not lower charges, so they are reported
+        # on their own and never counted as savings.
+        "last12_charges": round(sum(m["total_charges"] for m in monthly[-12:]), 2),
         "last12_credits": round(sum(m["credits"] for m in monthly[-12:]), 2),
+        "credit_months": [{"month": m["month"], "amount": m["credits"]}
+                          for m in monthly[-12:] if m["credits"]],
         "monthly": monthly[-12:],
         "current_items": sorted(current_items.values(),
                                 key=lambda i: -i["amount"]),
@@ -211,12 +218,15 @@ def price_table(prices):
     return dict(sorted(table.items()))
 
 
-def rightsizing(utilization, prices, current_items):
+def rightsizing(utilization, prices, current_items, keep=None):
     """Recommend a smaller bandwidth tier where traffic allows.
 
     Links are sized as redundant pairs (same cloud and bandwidth): each link
     must carry the pair's combined peak if its partner fails, plus HEADROOM.
+    `keep` maps connection names to a reason (from the notes file); those
+    links are always kept as they are, whatever their traffic.
     """
+    keep = keep or {}
     tiers = price_table(prices)
     cost = {i.get("uuid"): i["amount"] for i in current_items if i.get("uuid")}
     groups = defaultdict(list)
@@ -232,19 +242,23 @@ def rightsizing(utilization, prices, current_items):
         idle = combined_peak < IDLE_MBPS
         for link in links:
             current = cost.get(link["uuid"], tiers.get(bw, 0))
-            if idle:
+            if link["name"] in keep:
+                action, new = "keep", current
+            elif idle:
                 action, new = "decommission", 0
             elif tier < bw:
                 action, new = "downsize", tiers.get(tier, current)
             else:
                 action, new = "keep", current
+            kept = link["name"] in keep
             recs.append({
                 "action": action,
+                "kept_reason": keep.get(link["name"]),
                 "uuid": link["uuid"], "name": link["name"], "cloud": cloud,
                 "priority": link.get("priority"), "bandwidth": bw,
                 "peak": link["peak"], "combined_peak": round(combined_peak, 1),
                 "needed": round(needed, 1),
-                "recommended": 0 if idle else min(tier, bw),
+                "recommended": bw if kept else 0 if idle else min(tier, bw),
                 "current_cost": round(current, 2), "new_cost": round(new, 2),
                 "savings": round(current - new, 2),
             })

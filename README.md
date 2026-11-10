@@ -46,10 +46,29 @@ python collect_fabric_inventory.py --html report.html --pdf > inventory.json
 |---|---|---|
 | `--html PATH` | off | Write the interactive HTML report to `PATH` |
 | `--pdf [DIR]` | off (`reports/` if no folder given) | Write `Equinix_Report_YYYY-MM-DD_HHMM.pdf` to `DIR` |
+| `--notes PATH` | `report_notes.toml` | Comments and credit/circuit notes merged into the report (see below) |
 | `--days N` | 90 | Utilization window in days. BGP events and drop counters are capped at 89 days, which is all Equinix keeps. |
 
 A full run takes about 40 seconds. Every call is read-only, and if one API
 fails the rest still run; the failure is reported in the log.
+
+## Report notes
+
+`report_notes.toml` holds context the APIs can't know. It's read on every run
+and committed with the code, so keep secrets out of it. Edit it before a run:
+
+```toml
+[report]
+comments = ["Shown in the Notes section near the top of the report."]
+
+[credits."2026-05"]          # invoice month
+note = "Why this credit was issued"
+
+[circuits.aws_primary]       # connection name as it appears in Equinix
+purpose = "AD traffic"       # shown under the link name
+keep = true                  # never recommend downsizing or decommissioning
+note = "Used only for AD traffic, so low utilization is expected."
+```
 
 ## What the report contains
 
@@ -65,6 +84,9 @@ fails the rest still run; the failure is reported in the log.
 
 How the numbers are worked out:
 
+- **Credits** are one-time refunds or adjustments. They are reported on their
+  own and never counted as lower charges or savings: the run-rate, 12-month
+  charges (before tax) and monthly trend use charges only.
 - **Invoice lines** are matched to connections through the connection ID in
   the line description. Network Edge and Cloud Router lines are matched by
   their own IDs.
@@ -72,6 +94,7 @@ How the numbers are worked out:
   redundant pair. Each link must carry the pair's combined peak on its own,
   plus 50% headroom. A pair whose combined peak stays under 1 Mbps is flagged
   for decommissioning, and the report lists any networks it still carries.
+  Circuits with `keep = true` in `report_notes.toml` are always kept.
 - **Dropped packets** are Equinix's rate-limit drop counters (hourly, last 89
   days). Zero means no link was throttled; any non-zero value means the link is
   already too small, and the report warns against downsizing it.

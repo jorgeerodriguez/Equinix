@@ -228,8 +228,9 @@ def reliability_findings(health, routes, sizing):
     return out
 
 
-def findings(billing, util_rows, sizing, active_conns):
+def findings(billing, util_rows, sizing, active_conns, notes=None):
     """Plain-language key findings, most important first."""
+    notes = notes or {}
     out = []
     if billing and billing["monthly"]:
         first, last = billing["monthly"][0], billing["monthly"][-1]
@@ -237,15 +238,27 @@ def findings(billing, util_rows, sizing, active_conns):
         if first["total_charges"] and abs(change) / first["total_charges"] >= 0.05:
             pct = abs(change) / first["total_charges"] * 100
             out.append(("good" if change < 0 else "warn",
-                        f"Monthly spend is {'down' if change < 0 else 'up'} {pct:.0f}%",
+                        f"Monthly charges are {'down' if change < 0 else 'up'} {pct:.0f}%",
                         f"{money(last['total_charges'])} in {month_name(last['month'])}, "
                         f"compared with {money(first['total_charges'])} in "
-                        f"{month_name(first['month'])}."))
+                        f"{month_name(first['month'])}, before tax. Credits are not "
+                        "included in this comparison."))
+        if billing.get("credit_months"):
+            credit_notes = notes.get("credits", {})
+            parts = [f"{money(-c['amount'])} on the {month_name(c['month'])} invoice"
+                     + (f" ({credit_notes[c['month']]['note']})"
+                        if credit_notes.get(c["month"], {}).get("note") else "")
+                     for c in billing["credit_months"]]
+            out.append(("info", f"{money(-billing['last12_credits'])} in one-time credits "
+                        "over 12 months",
+                        "; ".join(parts) + ". Credits are refunds or adjustments, not "
+                        "lower monthly charges, so they are excluded from the run-rate, "
+                        "12-month charges and potential savings."))
         cats = last["charges"]
         top_cat = max(cats, key=cats.get)
         if last["total_charges"]:
             share = cats[top_cat] / last["total_charges"] * 100
-            out.append(("info", f"{top_cat} is {share:.0f}% of monthly spend",
+            out.append(("info", f"{top_cat} is {share:.0f}% of monthly charges",
                         f"{money(cats[top_cat])} of {money(last['total_charges'])} "
                         f"on the {month_name(last['month'])} invoice."))
     if sizing and sizing["monthly_savings"] > 0:
@@ -262,10 +275,13 @@ def findings(billing, util_rows, sizing, active_conns):
             tiers = sorted({(r["bandwidth"], r["recommended"]) for r in down})
             parts.append(f"downsizing {len(down)} links "
                          f"({'; '.join(f'{bandwidth(a)} to {bandwidth(b)}' for a, b in tiers)})")
+        kept = [r for r in sizing["links"] if r.get("kept_reason")]
         out.append(("good", f"Save about {money(sizing['monthly_savings'])} per month "
                     f"({money(sizing['monthly_savings'] * 12)} per year)",
                     "By " + " and ".join(parts) + ", while keeping enough capacity "
-                    "for one link to carry its pair's peak traffic."))
+                    "for one link to carry its pair's peak traffic."
+                    + (f" {' and '.join(r['name'] for r in kept)} are kept as they are "
+                       f"({kept[0]['kept_reason']})." if kept else "")))
     if util_rows:
         links = util_rows["links"]
         busiest = max(links, key=lambda r: r["peak_pct"])
@@ -354,6 +370,7 @@ def build_data(inventory):
                                 if any(p["connection"] == link["name"] for p in r["paths"])]
     util = (inventory.get("utilization") or {}).get("connections") or []
     drops = inventory.get("drops") or {}
+    notes = inventory.get("notes") or {}
     costs = {i["uuid"]: i["amount"] for i in (billing or {}).get("current_items", [])
              if i.get("uuid")}
     util_rows = utilization_rows(util, costs)
@@ -384,7 +401,7 @@ def build_data(inventory):
         "billing": billing and {
             "currency": billing["currency"],
             "runRate": billing["run_rate"],
-            "last12": billing["last12_total"],
+            "last12": billing.get("last12_charges", billing["last12_total"]),
             "credits": billing["last12_credits"],
             "latest": (billing.get("latest_invoice") or {}).get("transactionDate"),
             "monthly": billing["monthly"],
@@ -392,13 +409,17 @@ def build_data(inventory):
         },
         "util": util_rows,
         "sizing": sizing,
-        "findings": order_findings(findings(billing, util_rows, sizing, active)
+        "findings": order_findings(findings(billing, util_rows, sizing, active, notes)
                                    + drop_findings(drops, util_rows)
                                    + [dict(zip(("tone", "title", "body"), f)) for f in
                                       reliability_findings(health, routes, sizing)]),
         "reliability": health,
         "routes": routes,
         "dropDays": next((d["days"] for d in drops.values()), None),
+        "notes": {"comments": (notes.get("report") or {}).get("comments", []),
+                  "circuits": notes.get("circuits", {}),
+                  "credits": {m: c.get("note", "") for m, c in
+                              (notes.get("credits") or {}).items()}},
         "asns": [asn_row(a) for a in inventory.get("asns") or []],
         "footprint": {
             "active": len(active),
@@ -654,6 +675,10 @@ html.pdf .multiples > .panel:nth-child(2n) { margin-right: 0; }
   <section id="summary">
     <div class="kpis" id="kpis"></div>
     <div class="findings" id="findings"></div>
+    <div class="card" id="notes-card" hidden>
+      <div class="card-head"><h3>Notes</h3><span class="sub">From report_notes.toml</span></div>
+      <ul class="method" id="notes"></ul>
+    </div>
     <details class="tv" id="more-findings" hidden><summary></summary><div class="findings" id="findings-more" style="margin-top:12px"></div></details>
   </section>
 
@@ -782,6 +807,18 @@ function onResize(el, fn) {
   new ResizeObserver(() => { if (el.clientWidth !== w) { w = el.clientWidth; fn(); } }).observe(el);
 }
 
+/* ---------- notes (report_notes.toml) ---------- */
+const NOTES = D.notes || {comments: [], circuits: {}, credits: {}};
+// Purpose label shown under a link name, e.g. "AD traffic".
+const purpose = name => NOTES.circuits[name] && NOTES.circuits[name].purpose
+  ? `<span class="prefix-note">${esc(NOTES.circuits[name].purpose)}</span>` : "";
+{
+  const items = [...NOTES.comments.map(c => esc(c)),
+    ...Object.entries(NOTES.circuits).filter(([, c]) => c.note || c.purpose).map(([n, c]) =>
+      `<b>${esc(n)}</b>: ${esc(c.note || c.purpose)}${c.keep ? " Excluded from right-sizing." : ""}`)];
+  if (items.length) { $("notes").innerHTML = items.map(t => `<li>${t}</li>`).join(""); $("notes-card").hidden = false; }
+}
+
 /* ---------- header, KPIs, findings ---------- */
 const B = D.billing, U = D.util, S = D.sizing, F = D.footprint;
 const winStart = U ? new Date(U.start) : null;
@@ -800,7 +837,7 @@ if (B) {
   const ch = first && first.total_charges ? (last.total_charges - first.total_charges) / first.total_charges * 100 : 0;
   kpis.push(["Monthly run-rate", money(B.runRate), "",
     Math.abs(ch) >= 1 ? `<span class="delta ${ch < 0 ? "good" : "warn"}">${ch < 0 ? "▼" : "▲"} ${Math.abs(ch).toFixed(0)}% vs ${monthYear(first.month)}</span>` : "Recurring charges, before tax"]);
-  kpis.push(["Last 12 months", money(B.last12), "", B.credits ? `Includes ${money(-B.credits)} in credits` : "Invoiced, including tax"]);
+  kpis.push(["12-month charges", money(B.last12), "", B.credits ? `Before tax · ${money(-B.credits)} in credits listed separately` : "Before tax"]);
 }
 if (S) kpis.push(["Potential savings", money(S.monthly_savings), "/mo", `${money(S.monthly_savings * 12)} per year`]);
 if (U) kpis.push(["Peak traffic per cloud", mbps(F.peakCloud).split(" ")[0], mbps(F.peakCloud).split(" ")[1],
@@ -812,7 +849,7 @@ if (R) {
   const prod = mon.filter(l => !decom.has(l.uuid));
   const worst = prod.reduce((a, b) => (b.availability < a.availability ? b : a), prod[0]);
   if (worst) kpis.push(["Lowest link availability", worst.availability.toFixed(2), "%",
-    `${esc(worst.name)} · ${prod.reduce((t, l) => t + l.outages.length, 0)} outages in ${R.days} days`]);
+    `${esc(worst.name)} · ${prod.reduce((t, l) => t + l.outages.length, 0)} outages across ${prod.filter(l => l.outages.length).length} links in ${R.days} days`]);
 }
 kpis.push(["Footprint", F.active, " links", `${F.routers} Cloud Router · ${F.neNodes}-node firewall`]);
 $("kpis").innerHTML = kpis.map(([label, num, unit, sub]) =>
@@ -881,7 +918,8 @@ function drawSpend() {
 if (B) {
   const credits = B.monthly.filter(m => m.credits);
   $("spend-note").textContent = credits.length
-    ? "Credits are not drawn: " + credits.map(m => `${money(m.credits)} on the ${monthYear(m.month)} invoice`).join(", ") + "."
+    ? "Credits are one-time refunds or adjustments, so they are not drawn or counted as charges: " +
+      credits.map(m => `${money(m.credits)} on the ${monthYear(m.month)} invoice` + (NOTES.credits[m.month] ? ` (${NOTES.credits[m.month]})` : "")).join(", ") + "."
     : "";
   $("spend-sub").textContent = `${B.monthly.length} invoices · ${B.currency}`;
   const cats = D.categories.filter(c => B.monthly.some(m => m.charges[c] > 0));
@@ -915,7 +953,7 @@ if (U) {
   $("util-sub").textContent = `${U.links.length} links · last ${D.days} days · 5-minute samples` + (D.dropDays ? ` · drops over ${D.dropDays} days` : "");
   const hdr = ["Link", "Cloud", "Role", "Capacity", "Average", "95th pct", "Peak", "Peak vs capacity", "Dropped packets", "Monthly cost"];
   $("util-table").innerHTML = `<thead><tr>${hdr.map((h, i) => `<th class="${i >= 3 && i !== 7 ? "num" : ""}">${h}</th>`).join("")}</tr></thead><tbody>` +
-    U.links.map(l => `<tr><td class="name">${esc(l.name)}</td><td>${cloudChip(l.cloud)}</td><td><span class="prio">${esc(l.priority || "—")}</span></td>
+    U.links.map(l => `<tr><td class="name">${esc(l.name)}${purpose(l.name)}</td><td>${cloudChip(l.cloud)}</td><td><span class="prio">${esc(l.priority || "—")}</span></td>
       <td class="num">${bw(l.bandwidth)}</td><td class="num">${mbps(l.mean)}</td><td class="num">${mbps(l.p95)}</td><td class="num"><b>${mbps(l.peak)}</b></td>
       <td><div class="meter"><div class="track"><div class="fill" style="width:${Math.min(100, l.peak_pct)}%"></div></div><span>${l.peak_pct < 0.1 ? "<0.1" : l.peak_pct.toFixed(1)}%</span></div></td>
       <td class="num">${dropCell(l.drops)}</td>
@@ -986,7 +1024,7 @@ if (S && S.links.length) {
   $("size-sub").textContent = `${money(S.monthly_savings)}/mo · ${money(S.monthly_savings * 12)}/yr`;
   const hdr = ["Link", "Cloud", "Action", "Current", "Pair peak", "Dropped", "Needed", "Recommended", "Cost now", "Cost after", "Savings / mo"];
   $("size-table").innerHTML = `<thead><tr>${hdr.map((h, i) => `<th class="${i >= 3 ? "num" : ""}">${h}</th>`).join("")}</tr></thead><tbody>` +
-    S.links.map(r => `<tr><td class="name">${esc(r.name)}</td><td>${cloudChip(r.cloud)}</td><td><span class="pill ${ACT[r.action][0]}">${ACT[r.action][1]}</span>${r.action === "decommission" && r.prefixes && r.prefixes.length ? `<span class="prefix-note">Still carries ${esc(r.prefixes.join(", "))}</span>` : ""}</td>
+    S.links.map(r => `<tr><td class="name">${esc(r.name)}${purpose(r.name)}</td><td>${cloudChip(r.cloud)}</td><td><span class="pill ${ACT[r.action][0]}">${ACT[r.action][1]}</span>${r.action === "decommission" && r.prefixes && r.prefixes.length ? `<span class="prefix-note">Still carries ${esc(r.prefixes.join(", "))}</span>` : ""}</td>
       <td class="num">${bw(r.bandwidth)}</td><td class="num">${mbps(r.combined_peak)}</td><td class="num">${dropCell(r.drops)}</td><td class="num">${mbps(r.needed)}</td>
       <td class="num"><b>${r.recommended ? bw(r.recommended) : "—"}</b></td><td class="num">${money(r.current_cost)}</td><td class="num">${money(r.new_cost)}</td>
       <td class="num ${r.savings > 0 ? "saving" : ""}">${money(r.savings)}</td></tr>`).join("") +
@@ -994,6 +1032,7 @@ if (S && S.links.length) {
   const tiers = Object.entries(S.tiers).map(([b, p]) => `${bw(+b)} ${money(p)}`).join(" · ");
   $("method").innerHTML = [
     `Links are sized in redundant pairs (same cloud and bandwidth). Each link must be able to carry the pair's combined peak on its own if its partner fails, plus ${Math.round((S.headroom - 1) * 100)}% headroom ("Needed").`,
+    `Circuits marked keep = true in report_notes.toml (for example, ones that carry AD traffic) are always kept as they are.`,
     `A pair whose combined peak stayed under ${S.idle_mbps} Mbps over the last ${D.days} days is marked for decommissioning. Confirm it isn't a deliberate standby path first.`,
     `Cost after uses Equinix list prices for this metro: ${esc(tiers)} per month.`,
     `Peaks are 5-minute averages, so very short bursts can exceed them. "Dropped" counts packets Equinix discarded because a link exceeded its bandwidth${D.dropDays ? ` (last ${D.dropDays} days)` : ""}; any non-zero value means the link is already too small. Review month-end and quarterly jobs before downsizing.`,
