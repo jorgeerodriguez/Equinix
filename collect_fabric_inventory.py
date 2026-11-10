@@ -29,8 +29,8 @@ from dotenv import load_dotenv
 from equinix.services import fabricv4
 
 from insights import (INVOICE_FIELDS, bgp_health, bgp_settings, rightsizing,
-                      route_table, scrub, summarize_billing, summarize_stats,
-                      trim_lines)
+                      route_table, scrub, summarize_billing, summarize_drops,
+                      summarize_stats, trim_lines)
 from pdf_export import write_pdf
 from report import render_html
 
@@ -52,6 +52,8 @@ ROUTE_TYPES = ["IPv4_BGP_ROUTE", "IPv4_STATIC_ROUTE", "IPv4_DIRECT_ROUTE",
                "IPv6_BGP_ROUTE", "IPv6_STATIC_ROUTE", "IPv6_DIRECT_ROUTE"]
 EVENT_DAYS = 89
 RETRIES = 3
+DROP_METRICS = [f"equinix.fabric.connection.packets_dropped_{d}_{side}_rateexceeded.count"
+                for d in ("rx", "tx") for side in ("aside", "zside")]
 
 
 def log(msg):
@@ -283,6 +285,40 @@ def get_routing_protocols(token, conns):
     return result
 
 
+def get_drops(token, conns, days):
+    """Packets dropped for exceeding bandwidth, per connection (hourly
+    counters; the metrics API keeps 89 days)."""
+    end = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    start = end - datetime.timedelta(days=min(days, EVENT_DAYS))
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    drops = {}
+    for c in conns:
+        status, body = rest(token, "/fabric/v4/metrics/search", "POST", {
+            "filter": {"and": [
+                {"property": "/subject", "operator": "=",
+                 "values": [f"/fabric/v4/connections/{c['uuid']}"]},
+                {"property": "/name", "operator": "IN", "values": DROP_METRICS},
+                {"property": "/time", "operator": "BETWEEN",
+                 "values": [start.strftime(fmt), end.strftime(fmt)]}]},
+            # the metrics API rejects page sizes above 10 (4 metrics here)
+            "pagination": {"offset": 0, "limit": 10}})
+        d = summarize_drops(body.get("data") or [])
+        d["days"] = (end - start).days
+        drops[c["uuid"]] = d
+        log(f"[drops] HTTP {status} - {c.get('name')}: {d['total']:,} packets "
+            f"dropped in {d['hours_with_drops']} hours")
+    return drops
+
+
+def get_asns(client):
+    """ASNs registered with Equinix (SDK 0.22+)."""
+    status, body = read_json(fabricv4.ASNsApi(client).search_asns_without_preload_content(
+        fabricv4.AsnSearchRequestBody.from_dict(
+            {"pagination": {"offset": 0, "limit": PAGE_SIZE}})))
+    log(f"[asns] HTTP {status}")
+    return [scrub(a) for a in body.get("data") or []]
+
+
 def get_prices(token, metro):
     """List prices for Cloud Router -> cloud connections at each bandwidth."""
     status, body = rest(token, "/fabric/v4/prices/search", "POST", {
@@ -410,11 +446,14 @@ def money(value):
     return f"${value:,.0f}"
 
 
-def print_insights(util, billing, sizing, health, routes):
+def print_insights(util, billing, sizing, health, routes, drops):
     table("Utilization (active connections)",
-          ["Name", "Cloud", "Capacity", "Peak Mbps", "p95 Mbps", "Peak %"],
+          ["Name", "Cloud", "Capacity", "Peak Mbps", "p95 Mbps", "Peak %",
+           "Dropped pkts"],
           [[u["name"], u["cloud"], f"{u['bandwidth']} Mbps", f"{u['peak']:.1f}",
-            f"{u['p95']:.1f}", f"{u['peak_pct']}%"] for u in util])
+            f"{u['p95']:.1f}", f"{u['peak_pct']}%",
+            f"{drops[u['uuid']]['total']:,}" if u["uuid"] in drops else "-"]
+           for u in util])
     if billing:
         table("Monthly spend (invoice month)",
               ["Month", "Charges", "Credits"],
@@ -476,6 +515,11 @@ def main():
 
     util = collect("utilization",
                    lambda: get_utilization(token, conns["active"], args.days))
+    measured = {u["uuid"] for u in util}
+    drops = collect("drops", lambda: get_drops(
+        token, [c for c in conns["active"] if c["uuid"] in measured], args.days),
+        default=dict)
+    asns = collect("asns", lambda: get_asns(client))
     names = {x["uuid"]: x.get("name") for group in (conns, routers)
              for state in group.values() for x in state}
     for d in devices:
@@ -520,12 +564,13 @@ def main():
                  "cloud_routers": routers, "network_edge_devices": devices,
                  "utilization": {"days": args.days, "connections": util},
                  "billing": billing, "rightsizing": sizing,
-                 "reliability": health, "routes": routes}
+                 "reliability": health, "routes": routes,
+                 "drops": drops, "asns": asns}
     json.dump(inventory, sys.stdout, indent=2, default=str)
     print()
 
     print_tables(routers, conns, devices)
-    print_insights(util, billing, sizing, health, routes)
+    print_insights(util, billing, sizing, health, routes, drops)
     log(f"\n# {len(ports)} ports | connections: "
         f"{len(conns['active'])} active, {len(conns['deprovisioned'])} "
         f"deprovisioned | cloud routers: {len(routers['active'])} active, "

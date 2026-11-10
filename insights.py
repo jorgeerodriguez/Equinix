@@ -390,3 +390,25 @@ def route_table(routes, conns):
                      "origin_asn": origin, "cloud": paths[0]["cloud"]})
     key = lambda r: tuple(int(x) for x in re.split(r"[./]", r["prefix"]) if x.isdigit())
     return sorted(rows, key=key)
+
+
+# -------------------------------------------------------------- packet drops
+
+def summarize_drops(metrics):
+    """Packets dropped because a connection exceeded its bandwidth, from the
+    *_rateexceeded.count metrics of one connection."""
+    total, hours, worst, by_metric = 0, set(), [], {}
+    for m in metrics:
+        short = m.get("name", "").split(".")[-2].replace("packets_dropped_", "")
+        points = m.get("datapoints") or []
+        by_metric[short] = sum(p.get("value") or 0 for p in points)
+        total += by_metric[short]
+        for p in points:
+            if p.get("value"):
+                hours.add(p.get("endDateTime"))
+                worst.append((p.get("endDateTime"), p["value"], short))
+    worst.sort(key=lambda w: -w[1])
+    return {"total": round(total), "hours_with_drops": len(hours),
+            "samples": sum(len(m.get("datapoints") or []) for m in metrics),
+            "by_metric": by_metric,
+            "worst": [{"time": t, "packets": round(v), "metric": k} for t, v, k in worst[:5]]}

@@ -46,7 +46,7 @@ python collect_fabric_inventory.py --html report.html --pdf > inventory.json
 |---|---|---|
 | `--html PATH` | off | Write the interactive HTML report to `PATH` |
 | `--pdf [DIR]` | off (`reports/` if no folder given) | Write `Equinix_Report_YYYY-MM-DD_HHMM.pdf` to `DIR` |
-| `--days N` | 90 | Utilization window in days. BGP events are capped at 89 days, which is all Equinix keeps. |
+| `--days N` | 90 | Utilization window in days. BGP events and drop counters are capped at 89 days, which is all Equinix keeps. |
 
 A full run takes about 40 seconds. Every call is read-only, and if one API
 fails the rest still run; the failure is reported in the log.
@@ -57,11 +57,11 @@ fails the rest still run; the failure is reported in the log.
 |---|---|---|
 | Summary | Run-rate, 12-month spend, potential savings, peak traffic, lowest link availability, footprint, prioritized findings | All of the below |
 | Spend | Monthly charges by category (12 months) and the latest invoice by item | Billing v2 `/v2/invoices`, `/v2/invoices/details` |
-| Utilization | Average, 95th percentile and peak per link; 90-day hourly charts | Fabric `/connections/{id}/stats` |
+| Utilization | Average, 95th percentile and peak per link; 90-day hourly charts; packets dropped for exceeding bandwidth | Fabric `/connections/{id}/stats`, `/metrics/search` (`*_rateexceeded.count`) |
 | Right-sizing | Per-link action (keep, downsize, decommission), cost now and after | Utilization + Fabric `/prices/search` + invoices |
 | Reliability | BGP outages, flaps, downtime and availability per link; session timeline; BFD status | Fabric Cloud Events, routing protocols |
 | Routing | Networks learned by the Cloud Router and whether each has a backup path | Fabric `/routers/{id}/routes/search` |
-| Inventory | Network Edge devices, Cloud Routers, connections (active and deprovisioned) | Fabric v4 (SDK), Network Edge `/ne/v1/devices` |
+| Inventory | Network Edge devices, ASNs, Cloud Routers, connections (active and deprovisioned) | Fabric v4 (SDK, incl. `ASNsApi`), Network Edge `/ne/v1/devices` |
 
 How the numbers are worked out:
 
@@ -72,6 +72,9 @@ How the numbers are worked out:
   redundant pair. Each link must carry the pair's combined peak on its own,
   plus 50% headroom. A pair whose combined peak stays under 1 Mbps is flagged
   for decommissioning, and the report lists any networks it still carries.
+- **Dropped packets** are Equinix's rate-limit drop counters (hourly, last 89
+  days). Zero means no link was throttled; any non-zero value means the link is
+  already too small, and the report warns against downsizing it.
 - **Outages vs flaps:** a BGP session drop of 60 seconds or longer is an
   outage; a shorter one is a flap. When three or more sessions re-establish
   within 5 minutes with no drop recorded, it is reported as a network-wide
@@ -101,8 +104,13 @@ Treat `inventory.json`, the HTML report and the PDFs as internal documents.
 
 ## Limitations
 
-- The SDK (v0.20) only includes `fabricv4`, and its typed models reject some
-  real responses, so the script reads raw JSON from the SDK.
+- The SDK is pinned to `>=0.22,<0.23`: 0.22 fixed connection parsing and the
+  Cloud Router search filter, but renamed classes, so a new minor version may
+  need code changes. It still only includes `fabricv4` (no Network Edge or
+  Billing), and the script reads raw JSON rather than the typed models.
+- Equinix occasionally answers valid requests with HTTP 5xx; each collection
+  step is retried up to 3 times.
+- The metrics API accepts at most 10 results per page.
 - Equinix doesn't provide utilization or BGP data for connections that start
   at a Network Edge device.
 - Peaks are 5-minute averages, so shorter bursts can be higher.

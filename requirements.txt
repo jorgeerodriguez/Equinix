@@ -1,2 +1,2 @@
-equinix>=0.20.0
+equinix>=0.22,<0.23
 python-dotenv>=1.0.0

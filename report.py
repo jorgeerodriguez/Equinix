@@ -8,6 +8,8 @@ from insights import CATEGORIES
 
 CLOUD_NAMES = {"aws": "AWS", "gcp": "Google Cloud", "azure": "Azure",
                "oracle": "Oracle", "internet": "Internet", "other": "Other"}
+SERVICE_NAMES = {"IA": "Internet Access", "IX": "Internet Exchange",
+                 "CLOUD_ROUTER": "Cloud Router"}
 # Cloud-side attachment sizes; a link plateauing just under one of these
 # (below its own Equinix bandwidth) suggests the cloud side is the bottleneck.
 CLOUD_SIDE_SIZES = [1000, 2000, 5000]
@@ -298,6 +300,39 @@ def findings(billing, util_rows, sizing, active_conns):
     return [{"tone": t, "title": a, "body": b} for t, a, b in out]
 
 
+def asn_row(a):
+    assets = a.get("assets") or []
+    return {
+        "number": a.get("number"), "type": a.get("type"), "range": a.get("range"),
+        "state": a.get("state"), "metro": get(a, "location/metroCode"),
+        "attached": ", ".join(f"{SERVICE_NAMES.get(get(x, 'service/type'), get(x, 'service/type'))}"
+                              f" ({x.get('announcingMetro', '')})"
+                              for x in assets) or "—",
+        "created": min((get(x, "changeLog/createdDateTime")[:10] for x in assets), default=""),
+    }
+
+
+def drop_findings(drops, util_rows):
+    """Packets dropped for exceeding bandwidth: proof of (no) congestion."""
+    if not drops or not util_rows:
+        return []
+    days = next(iter(drops.values()))["days"]
+    names = {link["uuid"]: link["name"] for link in util_rows["links"]}
+    dropping = [(names.get(u, u), d) for u, d in drops.items() if d["total"] > 0]
+    if dropping:
+        name, worst = max(dropping, key=lambda x: x[1]["total"])
+        return [{"tone": "warn",
+                 "title": f"{len(dropping)} link{'s' if len(dropping) > 1 else ''} dropped "
+                          "packets for exceeding bandwidth",
+                 "body": f"Most on {name}: {worst['total']:,} packets in "
+                         f"{worst['hours_with_drops']} hours over {days} days. Don't "
+                         "downsize these links until the cause is understood."}]
+    return [{"tone": "good", "title": "No packets dropped for exceeding bandwidth",
+             "body": f"Equinix counted zero rate-limit drops on all {len(drops)} measured "
+                     f"links over the last {days} days, including the monthly bursts. "
+                     "Nothing is being throttled."}]
+
+
 def order_findings(items):
     """Warnings first, then savings/good news, then context."""
     rank = {"warn": 0, "good": 1, "info": 2}
@@ -318,9 +353,16 @@ def build_data(inventory):
             link["prefixes"] = [r["prefix"] for r in routes
                                 if any(p["connection"] == link["name"] for p in r["paths"])]
     util = (inventory.get("utilization") or {}).get("connections") or []
+    drops = inventory.get("drops") or {}
     costs = {i["uuid"]: i["amount"] for i in (billing or {}).get("current_items", [])
              if i.get("uuid")}
     util_rows = utilization_rows(util, costs)
+    if util_rows:
+        for link in util_rows["links"]:
+            link["drops"] = (drops.get(link["uuid"]) or {}).get("total")
+    if sizing:
+        for link in sizing["links"]:
+            link["drops"] = (drops.get(link["uuid"]) or {}).get("total")
     conn_rows = [connection_row(c, s) for s in ("active", "deprovisioned")
                  for c in conns[s]]
     active = [r for r in conn_rows if r["lifecycle"] == "active"]
@@ -351,10 +393,13 @@ def build_data(inventory):
         "util": util_rows,
         "sizing": sizing,
         "findings": order_findings(findings(billing, util_rows, sizing, active)
+                                   + drop_findings(drops, util_rows)
                                    + [dict(zip(("tone", "title", "body"), f)) for f in
                                       reliability_findings(health, routes, sizing)]),
         "reliability": health,
         "routes": routes,
+        "dropDays": next((d["days"] for d in drops.values()), None),
+        "asns": [asn_row(a) for a in inventory.get("asns") or []],
         "footprint": {
             "active": len(active),
             "cloudLinks": len(cloud_links),
@@ -664,6 +709,8 @@ html.pdf .multiples > .panel:nth-child(2n) { margin-right: 0; }
     <div class="sec-head"><h2>Inventory</h2></div>
     <div class="card-head"><h3>Network Edge devices</h3><span class="count" id="dev-count"></span></div>
     <div class="frame"><table id="devices"></table></div>
+    <div class="card-head" style="margin-top:8px"><h3>ASNs</h3><span class="count" id="asn-count"></span></div>
+    <div class="frame"><table id="asns"></table></div>
     <div class="card-head" style="margin-top:8px"><h3>Cloud Routers</h3>
       <div class="controls"><div class="seg" data-target="routers" data-key="lifecycle"></div></div></div>
     <div class="frame"><table id="routers"></table></div>
@@ -862,13 +909,16 @@ if (B) {
 onResize($("spend-chart"), drawSpend);
 
 /* ---------- utilization ---------- */
+// Packets dropped for exceeding bandwidth: a status, so it gets a pill.
+const dropCell = n => n == null ? "—" : n === 0 ? `<span class="pill ok">0</span>` : `<span class="pill warn">${n.toLocaleString()}</span>`;
 if (U) {
-  $("util-sub").textContent = `${U.links.length} links · last ${D.days} days · 5-minute samples`;
-  const hdr = ["Link", "Cloud", "Role", "Capacity", "Average", "95th pct", "Peak", "Peak vs capacity", "Monthly cost"];
+  $("util-sub").textContent = `${U.links.length} links · last ${D.days} days · 5-minute samples` + (D.dropDays ? ` · drops over ${D.dropDays} days` : "");
+  const hdr = ["Link", "Cloud", "Role", "Capacity", "Average", "95th pct", "Peak", "Peak vs capacity", "Dropped packets", "Monthly cost"];
   $("util-table").innerHTML = `<thead><tr>${hdr.map((h, i) => `<th class="${i >= 3 && i !== 7 ? "num" : ""}">${h}</th>`).join("")}</tr></thead><tbody>` +
     U.links.map(l => `<tr><td class="name">${esc(l.name)}</td><td>${cloudChip(l.cloud)}</td><td><span class="prio">${esc(l.priority || "—")}</span></td>
       <td class="num">${bw(l.bandwidth)}</td><td class="num">${mbps(l.mean)}</td><td class="num">${mbps(l.p95)}</td><td class="num"><b>${mbps(l.peak)}</b></td>
       <td><div class="meter"><div class="track"><div class="fill" style="width:${Math.min(100, l.peak_pct)}%"></div></div><span>${l.peak_pct < 0.1 ? "<0.1" : l.peak_pct.toFixed(1)}%</span></div></td>
+      <td class="num">${dropCell(l.drops)}</td>
       <td class="num">${l.cost != null ? money(l.cost) : "—"}</td></tr>`).join("") + "</tbody>";
 
   const shared = niceMax(Math.max(...U.links.map(l => l.peak)) || 1, 2);
@@ -934,19 +984,19 @@ if (U) {
 if (S && S.links.length) {
   const ACT = {decommission: ["warn", "Decommission"], downsize: ["info", "Downsize"], keep: ["ok", "Keep"]};
   $("size-sub").textContent = `${money(S.monthly_savings)}/mo · ${money(S.monthly_savings * 12)}/yr`;
-  const hdr = ["Link", "Cloud", "Action", "Current", "Pair peak", "Needed", "Recommended", "Cost now", "Cost after", "Savings / mo"];
+  const hdr = ["Link", "Cloud", "Action", "Current", "Pair peak", "Dropped", "Needed", "Recommended", "Cost now", "Cost after", "Savings / mo"];
   $("size-table").innerHTML = `<thead><tr>${hdr.map((h, i) => `<th class="${i >= 3 ? "num" : ""}">${h}</th>`).join("")}</tr></thead><tbody>` +
     S.links.map(r => `<tr><td class="name">${esc(r.name)}</td><td>${cloudChip(r.cloud)}</td><td><span class="pill ${ACT[r.action][0]}">${ACT[r.action][1]}</span>${r.action === "decommission" && r.prefixes && r.prefixes.length ? `<span class="prefix-note">Still carries ${esc(r.prefixes.join(", "))}</span>` : ""}</td>
-      <td class="num">${bw(r.bandwidth)}</td><td class="num">${mbps(r.combined_peak)}</td><td class="num">${mbps(r.needed)}</td>
+      <td class="num">${bw(r.bandwidth)}</td><td class="num">${mbps(r.combined_peak)}</td><td class="num">${dropCell(r.drops)}</td><td class="num">${mbps(r.needed)}</td>
       <td class="num"><b>${r.recommended ? bw(r.recommended) : "—"}</b></td><td class="num">${money(r.current_cost)}</td><td class="num">${money(r.new_cost)}</td>
       <td class="num ${r.savings > 0 ? "saving" : ""}">${money(r.savings)}</td></tr>`).join("") +
-    `</tbody><tfoot><tr><td colspan="7">Total</td><td class="num">${money(S.links.reduce((t, r) => t + r.current_cost, 0))}</td><td class="num">${money(S.links.reduce((t, r) => t + r.new_cost, 0))}</td><td class="num saving">${money(S.monthly_savings)}</td></tr></tfoot>`;
+    `</tbody><tfoot><tr><td colspan="8">Total</td><td class="num">${money(S.links.reduce((t, r) => t + r.current_cost, 0))}</td><td class="num">${money(S.links.reduce((t, r) => t + r.new_cost, 0))}</td><td class="num saving">${money(S.monthly_savings)}</td></tr></tfoot>`;
   const tiers = Object.entries(S.tiers).map(([b, p]) => `${bw(+b)} ${money(p)}`).join(" · ");
   $("method").innerHTML = [
     `Links are sized in redundant pairs (same cloud and bandwidth). Each link must be able to carry the pair's combined peak on its own if its partner fails, plus ${Math.round((S.headroom - 1) * 100)}% headroom ("Needed").`,
     `A pair whose combined peak stayed under ${S.idle_mbps} Mbps over the last ${D.days} days is marked for decommissioning. Confirm it isn't a deliberate standby path first.`,
     `Cost after uses Equinix list prices for this metro: ${esc(tiers)} per month.`,
-    `Peaks are 5-minute averages, so very short bursts can exceed them. Review month-end and quarterly jobs before downsizing.`,
+    `Peaks are 5-minute averages, so very short bursts can exceed them. "Dropped" counts packets Equinix discarded because a link exceeded its bandwidth${D.dropDays ? ` (last ${D.dropDays} days)` : ""}; any non-zero value means the link is already too small. Review month-end and quarterly jobs before downsizing.`,
     `Changing an Equinix tier usually means matching the cloud side as well: the AWS hosted connection capacity, or the Google VLAN attachment capacity.`,
   ].map(t => `<li>${t}</li>`).join("");
 } else {
@@ -1050,6 +1100,15 @@ const KIND = {VD: "Edge device", CLOUD_ROUTER: "Cloud router", SP: "Service prof
 const ep = e => `<span class="ep">${esc(e.name)}<small>${esc(KIND[e.kind] || e.kind)}</small></span>`;
 const count = (rows, k, v) => rows.filter(r => r[k] === v).length;
 const TABLES = {
+  asns: { rows: D.asns, cols: [
+    ["ASN", "number", r => esc(r.number), "mono name"],
+    ["Type", "type", r => esc((r.type || "").replace("_", " ").toLowerCase())],
+    ["Range", "range", r => esc((r.range || "").replace("_", "-").toLowerCase())],
+    ["State", "state", r => `<span class="pill ${r.state === "ATTACHED" ? "ok" : "warn"}">${esc(r.state)}</span>`],
+    ["Metro", "metro", r => esc(r.metro), "mono"],
+    ["Used by", "attached", r => esc(r.attached)],
+    ["Since", "created", r => esc(r.created), "date"],
+  ]},
   devices: { rows: D.devices, cols: [
     ["Name", "name", r => esc(r.name), "name"],
     ["Nodes", "nodes", r => esc(r.nodes)],
@@ -1085,6 +1144,7 @@ const TABLES = {
   ]},
 };
 const state = {
+  asns: { sort: null, dir: 1, filters: {} },
   devices: { sort: null, dir: 1, filters: {} },
   routers: { sort: null, dir: 1, filters: { lifecycle: "active" } },
   connections: { sort: null, dir: 1, filters: { lifecycle: "active", cloud: "all" }, q: "" },
@@ -1117,7 +1177,7 @@ function render(id) {
     th.onclick = go;
     th.onkeydown = e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } };
   });
-  const el = {devices: "dev-count", connections: "conn-count"}[id];
+  const el = {devices: "dev-count", connections: "conn-count", asns: "asn-count"}[id];
   if (el) $(el).textContent = rows.length === def.rows.length ? `${def.rows.length}` : `${rows.length} of ${def.rows.length}`;
 }
 function segment(el) {
@@ -1157,6 +1217,6 @@ if (location.hash === "#pdf") {
     render(id);
   }
 }
-$("foot").textContent = "Source: Equinix Fabric v4 (connections, Cloud Routers, routes, routing protocols, statistics, Cloud Events, prices), Network Edge v1 and Billing v2 APIs, via collect_fabric_inventory.py. Amounts in " + (B ? B.currency : "USD") + ", before tax unless noted.";
+$("foot").textContent = "Source: Equinix Fabric v4 (connections, Cloud Routers, routes, routing protocols, statistics, metrics, Cloud Events, ASNs, prices), Network Edge v1 and Billing v2 APIs, via collect_fabric_inventory.py. Amounts in " + (B ? B.currency : "USD") + ", before tax unless noted.";
 </script>
 """
