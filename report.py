@@ -202,8 +202,11 @@ def reliability_findings(health, routes, sizing):
         if flappy:
             n = sum(len(h["flaps"]) for h in flappy)
             longest = max(f["seconds"] for h in flappy for f in h["flaps"])
-            clouds = sorted({CLOUD_NAMES.get(h["cloud"], h["cloud"]) for h in flappy})
-            out.append(("warn", f"{' and '.join(clouds)} BGP sessions drop often",
+            # Name cloud links by provider; anything else (e.g. the firewall
+            # link) by its own name.
+            labels = sorted({CLOUD_NAMES[h["cloud"]] if h["cloud"] in ("aws", "gcp")
+                             else h["name"] for h in flappy})
+            out.append(("warn", f"BGP sessions drop often on {' and '.join(labels)}",
                         f"{n} brief drops across {len(flappy)} links, each back within "
                         f"{longest} s. The redundant pair absorbs them, but it is worth "
                         "raising with the provider."))

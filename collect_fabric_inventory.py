@@ -20,6 +20,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -50,6 +51,7 @@ PRICE_TIERS = [50, 100, 200, 500, 1000, 2000, 5000, 10000]
 ROUTE_TYPES = ["IPv4_BGP_ROUTE", "IPv4_STATIC_ROUTE", "IPv4_DIRECT_ROUTE",
                "IPv6_BGP_ROUTE", "IPv6_STATIC_ROUTE", "IPv6_DIRECT_ROUTE"]
 EVENT_DAYS = 89
+RETRIES = 3
 
 
 def log(msg):
@@ -90,11 +92,18 @@ def read_json(resp):
 def collect(name, fetch, default=list):
     """Run one collection step, logging success/failure without aborting."""
     log(f"[{name}] Querying ...")
-    try:
-        items = fetch()
-    except Exception as e:  # noqa: BLE001 - report and keep going
-        log(f"[{name}] FAILED: {e}")
-        return default()
+    for attempt in range(1, RETRIES + 1):
+        try:
+            items = fetch()
+            break
+        except Exception as e:  # noqa: BLE001 - report and keep going
+            # Equinix occasionally answers 5xx for valid requests; retry those.
+            if str(e).startswith("HTTP 5") and attempt < RETRIES:
+                log(f"[{name}] server error, retrying ({attempt}/{RETRIES - 1}): {str(e)[:80]}")
+                time.sleep(5 * attempt)
+                continue
+            log(f"[{name}] FAILED: {e}")
+            return default()
     found = len(items[0] if isinstance(items, tuple) else items)
     log(f"[{name}] OK - {found} found")
     return items
@@ -131,15 +140,13 @@ def get_connections(client):
             return items
 
 
-def get_cloud_routers(client):
-    search = fabricv4.CloudRouterSearchRequest(
-        filter=fabricv4.CloudRouterFilters(and_=[fabricv4.CloudRouterFilter(
-            fabricv4.CloudRouterSimpleExpression(
-                var_property="/state", operator="IN",
-                values=ROUTER_STATES))]),
-        pagination=fabricv4.PaginationRequest(offset=0, limit=PAGE_SIZE))
-    status, body = read_json(fabricv4.CloudRoutersApi(client)
-                             .search_cloud_routers_without_preload_content(search))
+def get_cloud_routers(token):
+    # Sent as plain REST: the SDK's CloudRouterFilter serializes to an empty
+    # filter ({}), which the API now rejects with HTTP 500.
+    status, body = rest(token, "/fabric/v4/routers/search", "POST", {
+        "filter": {"and": [{"property": "/state", "operator": "IN",
+                            "values": ROUTER_STATES}]},
+        "pagination": {"offset": 0, "limit": PAGE_SIZE}})
     log(f"[cloud_routers] HTTP {status}")
     return body.get("data") or []
 
@@ -461,7 +468,7 @@ def main():
     conns = collect("connections", lambda: get_connections(client))
     for c in conns:
         c["cloud"] = classify(c)
-    routers = collect("cloud_routers", lambda: get_cloud_routers(client))
+    routers = collect("cloud_routers", lambda: get_cloud_routers(token))
     devices = collect("network_edge", lambda: get_network_edge_devices(token))
 
     conns = split_lifecycle(conns, conn_status)
